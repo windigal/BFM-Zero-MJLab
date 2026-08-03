@@ -5,12 +5,12 @@
 
 import os
 
+from humanoidverse.agents.envs.expert_motion_loader import load_expert_trajectories_from_motion_lib
+from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from humanoidverse.agents.evaluations.humanoidverse_mjlab import (
     HumanoidVerseMjlabTrackingEvaluation,
     HumanoidVerseMjlabTrackingEvaluationConfig,
 )
-from humanoidverse.agents.envs.expert_motion_loader import load_expert_trajectories_from_motion_lib
-from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -21,10 +21,10 @@ torch.set_float32_matmul_precision("high")
 import json
 import time
 import typing as tp
-import warnings
+from collections import OrderedDict
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List
-from torch.utils._pytree import tree_map
 
 import gymnasium
 import numpy as np
@@ -32,8 +32,9 @@ import pydantic
 import torch  # better to use scoped import if we use processes
 import wandb
 from packaging.version import Version
+from torch.utils._pytree import tree_map
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
 
 from humanoidverse.agents.base import BaseConfig
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
@@ -43,13 +44,301 @@ from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig
 from humanoidverse.agents.misc.loggers import CSVLogger
 from humanoidverse.agents.tldr_dist_aux.agent import TldrDistAuxAgentConfig
 from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, set_seed_everywhere
-from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
+from humanoidverse.distributed import (
+    average_metrics,
+    barrier,
+    broadcast_agent_state,
+    broadcast_object,
+    module_sync_report,
+    sync_floating_buffers,
+)
 
 TRAIN_LOG_FILENAME = "train_log.txt"
 REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
 TRACKING_EVAL_LOG_FILENAME = "tracking_eval_log.csv"
 
 CHECKPOINT_DIR_NAME = "checkpoint"
+
+TRAIN_METRIC_GROUPS = OrderedDict(
+    [
+        (
+            "FB",
+            [
+                "B",
+                "B_norm",
+                "z_norm",
+                "F1",
+                "M1",
+                "target_M",
+                "fb_diag",
+                "fb_offdiag",
+                "orth_loss_diag",
+                "orth_loss_offdiag",
+                "orth_loss",
+                "q_loss",
+                "fb_loss",
+            ],
+        ),
+        (
+            "TeCH",
+            [
+                "tldr_te_loss",
+                "tldr_te_obj_mean",
+                "tldr_dist_mean",
+                "tldr_cst_penalty_mean",
+                "tldr_dual_lam",
+                "tldr_dual_loss",
+                "tldr_soft_term",
+            ],
+        ),
+        (
+            "GCR",
+            [
+                "gcr_contrastive_loss_raw",
+                "gcr_contrastive_loss",
+                "gcr_poincare_pos_dist",
+                "gcr_cos_pos",
+            ],
+        ),
+        (
+            "Discriminator",
+            [
+                "disc_expert_loss",
+                "disc_train_loss",
+                "disc_wgan_gp_loss",
+                "disc_expert_logit",
+                "disc_train_logit",
+                "disc_loss",
+                "mean_disc_reward",
+            ],
+        ),
+        ("Critic", ["target_Q", "Q1", "mean_next_Q", "unc_Q", "critic_loss", "mean_reward_train"]),
+        (
+            "Aux Critic",
+            ["target_auxQ", "auxQ1", "mean_next_auxQ", "unc_auxQ", "aux_critic_loss", "mean_aux_reward"],
+        ),
+        (
+            "Actor",
+            [
+                "Q_discriminator",
+                "Q_actor",
+                "Q_aux",
+                "Q_fb",
+                "q",
+                "disc_reward_actor",
+                "actor_loss",
+            ],
+        ),
+        ("Rewards", ["mean_env_reward", "mean_total_reward"]),
+        (
+            "Aux Rewards",
+            [
+                "aux_rew/penalty_torques",
+                "aux_rew/penalty_action_rate",
+                "aux_rew/limits_dof_pos",
+                "aux_rew/limits_torque",
+                "aux_rew/penalty_undesired_contact",
+                "aux_rew/penalty_feet_ori",
+                "aux_rew/penalty_ankle_roll",
+                "aux_rew/penalty_slippage",
+            ],
+        ),
+        ("Latent", ["z_norm/train", "z_norm/expert", "z_norm/mixed"]),
+        ("Weights", ["weight/disc_actor", "weight/aux_actor", "weight/scale_q", "weight/disc_reward_coef"]),
+        (
+            "Config",
+            [
+                "cfg/reg_coeff_disc",
+                "cfg/reg_coeff_aux",
+                "cfg/disc_reward_coef",
+                "cfg/train_goal_ratio",
+                "cfg/expert_asm_ratio",
+                "cfg/relabel_ratio",
+            ],
+        ),
+        (
+            "Environment",
+            [
+                "torso_contact_force_mean",
+                "torso_contact_force_max",
+                "torso_contact_force_p95",
+                "torso_contact_force_contact_count",
+                "torso_contact_force_contact_frac",
+                "torso_contact_force_mean_x",
+                "torso_contact_force_mean_y",
+                "torso_contact_force_mean_z",
+                "torso_contact_force_z_mean",
+                "torso_contact_force_z_max",
+                "torso_contact_force_z_p95",
+                "torso_z_mean",
+                "torso_z_min",
+                "torso_z_p05",
+                "torso_z_contact_mean",
+                "torso_z_contact_min",
+                "torso_z_contact_p05",
+            ],
+        ),
+        (
+            "Distributed",
+            [
+                "distributed/world_size",
+                "distributed/effective_batch_size",
+                "distributed/num_envs_per_rank",
+                "distributed/global_parallel_envs",
+                "distributed/replay_capacity_per_rank",
+                "distributed/effective_replay_capacity",
+                "distributed/trajectory_steps_per_rank",
+                "distributed/compile",
+                "distributed/local_env_steps",
+                "distributed/global_env_steps",
+                "distributed/optimizer_steps",
+            ],
+        ),
+    ]
+)
+
+
+def _format_metric_value(value: float | int) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    text = format(Decimal(str(float(value))), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        return "0"
+    return text
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _as_python_scalar(value: tp.Any) -> float | int | None:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.detach().cpu().item()
+    elif isinstance(value, np.ndarray):
+        if value.size != 1:
+            return None
+        value = value.item()
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    return None
+
+
+def _build_grouped_metrics(metrics: dict[str, tp.Any]) -> OrderedDict[str, list[tuple[str, float | int]]]:
+    scalar_metrics = {}
+    for key, value in metrics.items():
+        scalar = _as_python_scalar(value)
+        if scalar is not None:
+            scalar_metrics[key] = scalar
+
+    grouped = OrderedDict()
+    used = set()
+    for group_name, keys in TRAIN_METRIC_GROUPS.items():
+        items = [(key, scalar_metrics[key]) for key in keys if key in scalar_metrics]
+        if items:
+            grouped[group_name] = items
+            used.update(key for key, _ in items)
+    leftover = [(key, scalar_metrics[key]) for key in sorted(scalar_metrics.keys()) if key not in used]
+    if leftover:
+        grouped["Other"] = leftover
+    return grouped
+
+
+def _iter_tracked_group_metrics(
+    grouped_metrics: OrderedDict[str, list[tuple[str, float | int]]],
+) -> tp.Iterator[tuple[str, str, float | int]]:
+    for group_name in TRAIN_METRIC_GROUPS:
+        for key, value in grouped_metrics.get(group_name, []):
+            yield group_name, key, value
+
+
+def _render_grouped_train_log(
+    *,
+    grouped_metrics: OrderedDict[str, list[tuple[str, float | int]]],
+    timestep: int,
+    iteration: int,
+    max_iterations: int,
+    steps_per_second: float,
+    collection_time: float,
+    learning_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+) -> str:
+    width = 88
+    summary_labels = ["Computation", "Total timesteps", "Iteration time", "Time elapsed", "ETA"]
+    metric_labels = [
+        key if "/" in key else f"{group_name}/{key}"
+        for group_name, items in grouped_metrics.items()
+        for key, _ in items
+    ]
+    label_width = max([len(label) for label in metric_labels + summary_labels], default=0)
+    lines = [
+        "#" * width,
+        f"{'Learning iteration ' + str(iteration) + '/' + str(max_iterations):^{width}}",
+        "",
+        (
+            f"{'Computation':>{label_width}}: "
+            f"{_format_metric_value(steps_per_second)} steps/s "
+            f"(collection: {collection_time:.3f}s, learning: {learning_time:.3f}s)"
+        ),
+    ]
+    for group_name, items in grouped_metrics.items():
+        for key, value in items:
+            metric_label = key if "/" in key else f"{group_name}/{key}"
+            lines.append(f"{metric_label:>{label_width}}: {_format_metric_value(value)}")
+    lines.extend(
+        [
+            "-" * width,
+            f"{'Total timesteps':>{label_width}}: {timestep}",
+            f"{'Iteration time':>{label_width}}: {collection_time + learning_time:.2f}s",
+            f"{'Time elapsed':>{label_width}}: {_format_duration(elapsed_time)}",
+            f"{'ETA':>{label_width}}: {_format_duration(eta_seconds)}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _tensorboard_tag(group_name: str, key: str) -> str:
+    group_slug = group_name.lower().replace(" ", "_")
+    known_prefixes = {
+        "Aux Rewards": "aux_rew/",
+        "Latent": "z_norm/",
+        "Weights": "weight/",
+        "Config": "cfg/",
+        "Distributed": "distributed/",
+    }
+    prefix = known_prefixes.get(group_name)
+    tag_key = key.removeprefix(prefix) if prefix else key
+    return f"train/{group_slug}/{tag_key}"
+
+
+def _log_grouped_tensorboard(
+    writer: SummaryWriter | None,
+    grouped_metrics: OrderedDict[str, list[tuple[str, float | int]]],
+    timestep: int,
+    *,
+    steps_per_second: float,
+    collection_time: float,
+    learning_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+    iteration: int,
+) -> None:
+    if writer is None:
+        return
+    for group_name, key, value in _iter_tracked_group_metrics(grouped_metrics):
+        writer.add_scalar(_tensorboard_tag(group_name, key), value, timestep)
+    writer.flush()
 
 
 Evaluation = tp.Annotated[
@@ -407,7 +696,16 @@ def init_wandb(cfg: TrainConfig):
     from pathlib import Path
     exp_name = cfg.wandb_run_name if cfg.wandb_run_name else Path(cfg.work_dir).name
     wandb_config = cfg.model_dump()
-    wandb.init(entity=cfg.wandb_ename, project=cfg.wandb_pname, group=cfg.wandb_gname, name=exp_name, config=wandb_config, dir="./_wandb")
+    wandb_dir = Path(cfg.work_dir) / "_wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    wandb.init(
+        entity=cfg.wandb_ename,
+        project=cfg.wandb_pname,
+        group=cfg.wandb_gname,
+        name=exp_name,
+        config=wandb_config,
+        dir=str(wandb_dir),
+    )
 
 
 class Workspace:
@@ -446,6 +744,7 @@ class Workspace:
                 OmegaConf.save(self.train_env_info["unresolved_conf"], file)
 
         self.train_logger = CSVLogger(filename=self.work_dir / TRAIN_LOG_FILENAME) if self._write_shared_artifacts else None
+        self.tb_writer = SummaryWriter(log_dir=str(self.work_dir / "tensorboard")) if self.distributed_rank == 0 else None
 
         set_seed_everywhere(self.cfg.seed)
 
@@ -496,7 +795,11 @@ class Workspace:
 
     def train(self):
         self.start_time = time.time()
-        self.train_online()
+        try:
+            self.train_online()
+        finally:
+            if self.tb_writer is not None:
+                self.tb_writer.close()
 
     def _get_torso_contact_force_metrics(self, train_env) -> dict[str, float]:
         if not self.cfg.log_torso_contact_forces:
@@ -636,7 +939,10 @@ class Workspace:
         total_metrics, context = None, None
         metric_update_counts: dict[str, int] = {}
         start_time = time.time()
-        fps_start_time = time.time()
+        collection_time_acc = 0.0
+        learning_time_acc = 0.0
+        steps_since_last_log = 0
+        train_time_total = 0.0
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.checkpoint_every_steps)
         eval_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_local_time, self.cfg.update_agent_every)
@@ -754,6 +1060,7 @@ class Workspace:
                     )
                 break
 
+            rollout_start = time.time()
             with torch.no_grad():
                 obs = tree_map(lambda x: torch.tensor(x, dtype=dtype_numpytotorch_lower_precision(x.dtype), device=self.agent.device), td)
                 # TODO consistency with obs_space: remove time assigned by TimeAwareObservationWrapper
@@ -820,6 +1127,8 @@ class Workspace:
                         optimizer_steps=self._optimizer_steps,
                     )
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            collection_time_acc += time.time() - rollout_start
+            steps_since_last_log += global_step_increment
             if check_rollout_nonfinite:
                 _assert_finite(
                     new_td,
@@ -922,6 +1231,7 @@ class Workspace:
 
             if len(replay_buffer["train"]) > 0 and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
                 update_agent_time_checker.update_last_step(local_time)
+                learning_start = time.time()
                 for _ in range(self.cfg.num_agent_updates):
                     metrics = self.agent.update(replay_buffer, local_time)
                     self._optimizer_steps += 1
@@ -954,19 +1264,19 @@ class Workspace:
                         metric_update_counts,
                         metrics,
                     )
+                learning_time_acc += time.time() - learning_start
 
             if log_time_checker.check(global_time) and total_metrics is not None:
                 log_time_checker.update_last_step(global_time)
+                current_global_time = min(global_time + global_step_increment, self.cfg.num_env_steps)
+                current_local_time = local_time + local_step_increment
                 m_dict = {}
                 for k in sorted(list(total_metrics.keys())):
                     tmp = total_metrics[k] / metric_update_counts[k]
                     m_dict[k] = np.round(tmp.mean().item(), 6)
                 m_dict.update(self._get_torso_contact_force_metrics(train_env))
-                m_dict["duration [minutes]"] = (time.time() - start_time) / 60
-                m_dict["FPS"] = (1 if global_time == 0 else self.cfg.log_every_updates) / (time.time() - fps_start_time)
                 if self.cfg.distributed_sync and self.distributed_world_size > 1:
                     m_dict["distributed/world_size"] = self.distributed_world_size
-                    m_dict["distributed/loss_mode"] = _distributed_loss_mode(self.cfg)
                     m_dict["distributed/effective_batch_size"] = _effective_batch_size(self.cfg)
                     m_dict["distributed/num_envs_per_rank"] = _num_envs_per_rank(self.cfg)
                     m_dict["distributed/global_parallel_envs"] = _global_parallel_envs(self.cfg)
@@ -974,21 +1284,59 @@ class Workspace:
                     m_dict["distributed/effective_replay_capacity"] = _effective_replay_capacity(self.cfg)
                     m_dict["distributed/trajectory_steps_per_rank"] = _trajectory_steps_per_rank(self.cfg)
                     m_dict["distributed/compile"] = int(bool(self.cfg.agent.compile))
-                m_dict["distributed/local_env_steps"] = int(local_time)
-                m_dict["distributed/global_env_steps"] = int(global_time)
+                m_dict["distributed/local_env_steps"] = int(current_local_time)
+                m_dict["distributed/global_env_steps"] = int(current_global_time)
                 m_dict["distributed/optimizer_steps"] = int(self._optimizer_steps)
+
+                interval_train_time = collection_time_acc + learning_time_acc
+                train_time_total += interval_train_time
+                interval_fps = steps_since_last_log / max(interval_train_time, 1e-9)
+                total_train_steps = max(current_global_time - self._checkpoint_global_time, 0)
+                avg_train_fps = total_train_steps / max(train_time_total, 1e-9) if total_train_steps > 0 else interval_fps
+                current_iteration = current_global_time // global_step_increment
+                max_iterations = (self.cfg.num_env_steps + global_step_increment - 1) // global_step_increment
+                elapsed_time = time.time() - start_time
+                remaining_steps = max(self.cfg.num_env_steps - current_global_time, 0)
+                eta_seconds = remaining_steps / max(avg_train_fps, 1e-9) if remaining_steps > 0 else 0.0
+                grouped_metrics = _build_grouped_metrics(m_dict)
+
                 if self._write_shared_artifacts and self.cfg.use_wandb:
                     wandb.log(
-                        {f"train/{k}": v for k, v in m_dict.items()},
-                        step=global_time,
+                        {f"train/{key}": value for _, key, value in _iter_tracked_group_metrics(grouped_metrics)},
+                        step=current_global_time,
                     )
                 if self._write_shared_artifacts:
-                    print(m_dict)
+                    log_text = _render_grouped_train_log(
+                        grouped_metrics=grouped_metrics,
+                        timestep=current_global_time,
+                        iteration=current_iteration,
+                        max_iterations=max_iterations,
+                        steps_per_second=interval_fps,
+                        collection_time=collection_time_acc,
+                        learning_time=learning_time_acc,
+                        elapsed_time=elapsed_time,
+                        eta_seconds=eta_seconds,
+                    )
+                    print(log_text, flush=True)
+                _log_grouped_tensorboard(
+                    self.tb_writer,
+                    grouped_metrics,
+                    current_global_time,
+                    steps_per_second=interval_fps,
+                    collection_time=collection_time_acc,
+                    learning_time=learning_time_acc,
+                    elapsed_time=elapsed_time,
+                    eta_seconds=eta_seconds,
+                    iteration=current_iteration,
+                )
                 total_metrics = None
                 metric_update_counts = {}
-                fps_start_time = time.time()
-                m_dict["timestep"] = global_time
-                m_dict["local_timestep"] = local_time
+                collection_time_acc = 0.0
+                learning_time_acc = 0.0
+                steps_since_last_log = 0
+                m_dict["timestep"] = current_global_time
+                m_dict["local_timestep"] = current_local_time
+                m_dict["iteration"] = current_iteration
                 if self.train_logger is not None:
                     self.train_logger.log(m_dict)
 
@@ -1030,9 +1378,19 @@ class Workspace:
             # For wandb dict, put it on wandb
             if self._write_shared_artifacts and self.cfg.use_wandb and wandb_dict is not None:
                 wandb.log(
-                    {f"eval/{evaluation_name}/{k}": v for k, v in wandb_dict.items()},
+                    {
+                        f"eval/{evaluation_name}/{k}": scalar
+                        for k, v in wandb_dict.items()
+                        if (scalar := _as_python_scalar(v)) is not None
+                    },
                     step=t,
                 )
+            if wandb_dict is not None and self.tb_writer is not None:
+                for key, value in wandb_dict.items():
+                    scalar = _as_python_scalar(value)
+                    if scalar is not None:
+                        self.tb_writer.add_scalar(f"eval/{evaluation_name}/{key}", scalar, t)
+                self.tb_writer.flush()
 
             evaluation_results[evaluation_name] = evaluation_metrics
 

@@ -21,6 +21,7 @@ def build_agent_preset(
     clip_grad_norm: float,
     cartwheel_aux_safe: bool,
     wandb_project: str,
+    wandb_group: str = "mjlab",
 ) -> dict[str, Any]:
     if agent == "fb":
         return {
@@ -32,7 +33,7 @@ def build_agent_preset(
                 clip_grad_norm=clip_grad_norm,
                 cartwheel_aux_safe=cartwheel_aux_safe,
             ),
-            "wandb_group": "ufo_fb",
+            "wandb_group": wandb_group,
             "wandb_project": wandb_project,
             "train_runtime": dict(FB_TRAIN_RUNTIME),
         }
@@ -43,7 +44,7 @@ def build_agent_preset(
                 compile=compile,
                 update_z_every_step=update_z_every_step,
             ),
-            "wandb_group": "ufo_tech",
+            "wandb_group": wandb_group,
             "wandb_project": wandb_project,
             "train_runtime": dict(TECH_TRAIN_RUNTIME),
         }

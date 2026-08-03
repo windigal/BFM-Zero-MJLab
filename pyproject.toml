@@ -28,6 +28,7 @@ dependencies = [
     "pydantic>=2.11.3",
     "rich>=14.0.0",
     "safetensors>=0.5.3",
+    "tensorboard>=2.18.0",
     "tensordict>=0.8.3",
     "termcolor>=3.0.1",
     "torch>=2.7.0,<2.8.0",

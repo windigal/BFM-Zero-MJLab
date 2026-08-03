@@ -40,7 +40,7 @@ class AgentAliasesTest(unittest.TestCase):
     def test_tech_default_update_z_every_step(self) -> None:
         self.assertEqual(_default_update_z_every_step("tech"), 10)
 
-    def test_tech_preset_uses_tech_wandb_group(self) -> None:
+    def test_tech_preset_uses_fixed_wandb_group(self) -> None:
         selected = build_agent_preset(
             agent="tech",
             device="cpu",
@@ -51,11 +51,11 @@ class AgentAliasesTest(unittest.TestCase):
             cartwheel_aux_safe=False,
             wandb_project="test",
         )
-        self.assertEqual(selected["wandb_group"], "ufo_tech")
+        self.assertEqual(selected["wandb_group"], "mjlab")
         self.assertEqual(selected["agent_cfg"].name, "TldrDistAuxAgent")
         self.assertEqual(selected["agent_cfg"].train.update_z_every_step, 10)
 
-    def test_tech_build_config_uses_canonical_public_names(self) -> None:
+    def test_tech_build_config_uses_fixed_wandb_location(self) -> None:
         cfg = build_ufo_mjlab_config(
             device="cpu",
             work_dir="/tmp/ufo_agent_alias_test",
@@ -67,14 +67,16 @@ class AgentAliasesTest(unittest.TestCase):
             smoke=True,
             agent="tech",
         )
-        self.assertEqual(cfg.wandb_gname, "ufo_tech")
+        self.assertEqual(cfg.wandb_ename, "windigal")
+        self.assertEqual(cfg.wandb_pname, "bfm-zero")
+        self.assertEqual(cfg.wandb_gname, "mjlab")
         self.assertEqual(cfg.wandb_run_name, "ufo_tech")
         self.assertEqual(cfg.tags["agent"], "tech")
 
     def test_readme_exposes_tech_training(self) -> None:
         readme = (ROOT / "README.md").read_text()
         self.assertNotIn("TLDR Training", readme)
-        self.assertIn("TeCH Training", readme)
+        self.assertIn("TeCH training", readme)
         self.assertIn("--agent tech", readme)
         self.assertNotIn("  --agent tldr", readme)
         self.assertNotIn("ufo_tldr", readme)

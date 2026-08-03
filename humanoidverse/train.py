@@ -10,6 +10,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -39,12 +40,14 @@ DEFAULT_NUM_ENVS = 1024
 DEFAULT_NUM_ENV_STEPS = 192000000
 DEFAULT_CHECKPOINT_EVERY_STEPS = 3200000
 DEFAULT_DATA_PATH = "humanoidverse/data/lafan_29dof_10s-clipped.pkl"
-DEFAULT_WORK_DIR = "runs/ufo"
+DEFAULT_WORK_DIR = "runs/bfm_zero_seed"
 DEFAULT_BUFFER_SIZE = 5120000
 DEFAULT_FB_UPDATE_Z_EVERY_STEP = 100
 DEFAULT_TECH_UPDATE_Z_EVERY_STEP = 10
 DEFAULT_UPDATE_Z_EVERY_STEP = DEFAULT_FB_UPDATE_Z_EVERY_STEP
-DEFAULT_WANDB_PROJECT = "ufo-humanoid"
+DEFAULT_WANDB_ENTITY = "windigal"
+DEFAULT_WANDB_PROJECT = "bfm-zero"
+DEFAULT_WANDB_GROUP = "mjlab"
 DEFAULT_ROBOT_CONFIG = "configs/robots/g1_29dof.yaml"
 
 AGENT_ALIASES = {
@@ -156,6 +159,7 @@ def build_ufo_mjlab_config(
         clip_grad_norm=clip_grad_norm,
         cartwheel_aux_safe=cartwheel_aux_safe,
         wandb_project=DEFAULT_WANDB_PROJECT,
+        wandb_group=DEFAULT_WANDB_GROUP,
     )
     agent_cfg = selected["agent_cfg"]
     wandb_group = selected["wandb_group"]
@@ -228,7 +232,7 @@ def build_ufo_mjlab_config(
         use_trajectory_buffer=train_runtime["use_trajectory_buffer"],
         buffer_size=int(buffer_size),
         use_wandb=use_wandb,
-        wandb_ename=os.environ.get("WANDB_ENTITY"),
+        wandb_ename=os.environ.get("WANDB_ENTITY", DEFAULT_WANDB_ENTITY),
         wandb_gname=wandb_group,
         wandb_pname=wandb_project,
         wandb_run_name=wandb_run_name or f"ufo_{agent}",
@@ -290,9 +294,61 @@ def _init_distributed(local_rank: int, world_size: int) -> None:
             dist.init_process_group(**init_kwargs)
 
 
-def run_train(args: argparse.Namespace, log_dir: Path) -> None:
+def _new_timestamped_run_dir(work_dir: Path, timestamp: str | None = None) -> Path:
+    """Create one unique timestamp-named run directory below ``work_dir``."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = timestamp or datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    suffix = 0
+    while True:
+        name = timestamp if suffix == 0 else f"{timestamp}_{suffix:02d}"
+        candidate = work_dir / name
+        try:
+            candidate.mkdir(parents=False, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            pass
+        suffix += 1
+
+
+def _distributed_timestamped_run_dir(
+    work_dir: Path,
+    *,
+    local_rank: int,
+    rank: int,
+    world_size: int,
+) -> Path:
+    """Create one shared timestamped directory for an external torchrun job."""
+    if world_size <= 1:
+        return _new_timestamped_run_dir(work_dir)
+
+    import torch
+    import torch.distributed as dist
+
+    payload: list[str | None] = [None]
+    if rank == 0:
+        payload[0] = _new_timestamped_run_dir(work_dir).name
+    dist.broadcast_object_list(
+        payload,
+        src=0,
+        device=torch.device(f"cuda:{local_rank}"),
+    )
+    if payload[0] is None:
+        raise RuntimeError("Rank 0 did not broadcast a timestamped run directory")
+    run_dir = work_dir / payload[0]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def run_train(args: argparse.Namespace, log_dir: Path, log_dir_is_final: bool = False) -> None:
     device, _local_rank, rank, world_size = _select_device_and_rank(args.seed)
     _init_distributed(_local_rank, world_size)
+    if not log_dir_is_final:
+        log_dir = _distributed_timestamped_run_dir(
+            log_dir,
+            local_rank=_local_rank,
+            rank=rank,
+            world_size=world_size,
+        )
     seed = args.seed + rank
     cfg = build_ufo_mjlab_config(
         device=device,
@@ -301,7 +357,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         num_env_steps=args.num_env_steps,
         seed=seed,
         use_wandb=bool(args.use_wandb and rank == 0),
-        wandb_run_name=args.wandb_run_name,
+        wandb_run_name=args.wandb_run_name or log_dir.name,
         checkpoint_every_steps=args.checkpoint_every_steps,
         distributed_rank=rank,
         distributed_world_size=world_size,
@@ -345,11 +401,11 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
 
 
 def launch(args: argparse.Namespace) -> None:
-    log_dir = Path(args.work_dir).expanduser().resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(args.work_dir).expanduser().resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
     _ensure_compile_cache()
     if args.gpu_ids in (None, "single"):
-        run_train(args, log_dir)
+        run_train(args, work_dir)
         return
 
     existing_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -369,7 +425,7 @@ def launch(args: argparse.Namespace) -> None:
     if num_gpus <= 1:
         if selected_gpus is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpus)
-        run_train(args, log_dir)
+        run_train(args, work_dir)
         return
 
     import torchrunx
@@ -377,7 +433,8 @@ def launch(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO)
     if selected_gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected_gpus)
-    os.environ.setdefault("TORCHRUNX_LOG_DIR", str(log_dir / "torchrunx"))
+    log_dir = _new_timestamped_run_dir(work_dir)
+    os.environ["TORCHRUNX_LOG_DIR"] = str(log_dir / "torchrunx")
     torchrunx.Launcher(
         hostnames=["localhost"],
         workers_per_host=num_gpus,
@@ -397,7 +454,7 @@ def launch(args: argparse.Namespace) -> None:
             "CUDA_CACHE_PATH",
             "WARP_CACHE_PATH",
         ),
-    ).run(run_train, args, log_dir)
+    ).run(run_train, args, log_dir, True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -409,7 +466,14 @@ def parse_args() -> argparse.Namespace:
         help="Training agent preset: fb or tech. tldr is a deprecated alias for tech.",
     )
     parser.add_argument("--gpu-ids", default="single", help="'single', 'all', or a comma-separated GPU id list relative to CUDA_VISIBLE_DEVICES.")
-    parser.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
+    parser.add_argument(
+        "--work-dir",
+        default=DEFAULT_WORK_DIR,
+        help=(
+            "Parent directory for training runs. Each launch creates a new "
+            "YYYYMMDD_HHMMSS child directory."
+        ),
+    )
     parser.add_argument(
         "--robot-config",
         type=Path,
