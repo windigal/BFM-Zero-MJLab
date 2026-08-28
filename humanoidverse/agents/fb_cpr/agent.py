@@ -37,6 +37,10 @@ class FBcprAgentTrainConfig(FBAgentTrainConfig):
     # Commented out as example but not useful
     # grad_penalty_obs_weight: float | None = None  # must be in (0,1)
     weight_decay_discriminator: float = 0.0
+    # Skip discriminator training and drop its critic term from the actor loss.
+    # The discriminator/critic modules stay constructed so checkpoints remain
+    # load-compatible in both directions.
+    disable_discriminator: bool = False
 
 
 class FBcprAgentConfig(BaseConfig):
@@ -72,7 +76,11 @@ class FBcprAgent(FBAgent):
         self._model.to(self.device)
         self.setup_training()
         self.setup_compile()
-        self.env_idx_with_expert_rollout = None
+        # FBcprAgent builds its extra networks before initializing optimizers and
+        # therefore cannot call FBAgent.__init__.  Keep the shared transient
+        # PACE rollout state initialized explicitly on this constructor path.
+        self._init_pace_runtime_state()
+        self.apply_training_freezes()
 
     @classmethod
     def supported_evaluations(cls):
@@ -108,6 +116,16 @@ class FBcprAgent(FBAgent):
             capturable=self.cfg.cudagraphs and not self.cfg.compile,
             weight_decay=self.cfg.train.weight_decay_discriminator,
         )
+
+    def apply_training_freezes(self) -> None:
+        super().apply_training_freezes()
+        if self.cfg.train.disable_discriminator:
+            for module in (
+                self._model._discriminator,
+                self._model._critic,
+                self._model._target_critic,
+            ):
+                module.eval().requires_grad_(False)
 
     def setup_compile(self):
         super().setup_compile()

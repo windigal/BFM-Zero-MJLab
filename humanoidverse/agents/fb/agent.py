@@ -3,8 +3,10 @@
 # This source code is licensed under the CC BY-NC 4.0 license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import json
 import pickle
+import typing as tp
 from pathlib import Path
 from typing import Dict, Literal, Tuple
 
@@ -20,6 +22,9 @@ from ..misc.zbuffer import ZBuffer
 from ..nn_models import _soft_update_params, eval_mode, weight_init
 from ...distributed import average_gradients
 from .model import FBModel, FBModelConfig
+
+
+PACE_REFERENCE_ACTOR_FILENAME = "pace_reference_actor.safetensors"
 
 
 class FBAgentTrainConfig(BaseConfig):
@@ -41,8 +46,9 @@ class FBAgentTrainConfig(BaseConfig):
     update_z_every_step: int = 150
     z_buffer_size: int = 10000
     rollout_expert_trajectories: bool = False
-    rollout_expert_trajectories_length: int = 250
+    rollout_expert_trajectories_length: int = 500
     rollout_expert_trajectories_percentage: float = 0.25
+    freeze_backward: bool = False
 
 
 class FBAgentConfig(BaseConfig):
@@ -74,11 +80,149 @@ class FBAgent:
         # This is just to be sure? I think it should not change since build
         self._model.to(self.device)
 
+        self._init_pace_runtime_state()
+        self.apply_training_freezes()
+
+    def _init_pace_runtime_state(self) -> None:
+        """Initialize transient PACE state for every FB-derived constructor."""
         self.env_idx_with_expert_rollout = None
+        self._pace_enabled = False
+        self._pace_reference_actor = None
+        self._pace_lambda_con = 0.0
+        self._pace_runtime_metrics: dict[str, float] = {}
+        self._pace_update_count = 0
+        self._pace_actor_updates_enabled = True
+        self._pace_actor_update_every = 1
+        self._pace_actor_lr_multiplier = 1.0
+        self._pace_actor_base_lrs: list[float] = []
+        self._pace_acquisition_loss_weight = 1.0
+        self._pace_consolidation_scale = 1.0
+        self._pace_grad_acquisition_ema = 0.0
+        self._pace_grad_consolidation_ema = 0.0
+        self._pace_grad_ema_initialized = False
+        self._pace_grad_cosine = 0.0
+        self._pace_tracking_z = None
+        self._pace_tracking_lengths = None
+        self._pace_fixed_z = None
 
     @property
     def device(self):
         return self._model.device
+
+    @property
+    def backward_frozen(self) -> bool:
+        return bool(self.cfg.train.freeze_backward or self._pace_enabled)
+
+    def apply_training_freezes(self) -> None:
+        """Keep the learned representation fixed without enabling PACE."""
+        if not self.backward_frozen:
+            return
+        for module in (
+            self._model._backward_map,
+            self._model._target_backward_map,
+            self._model._obs_normalizer,
+        ):
+            module.eval().requires_grad_(False)
+
+    def enable_pace(
+        self,
+        *,
+        lambda_con: float,
+        fixed_goal_steps: int = 100,
+        expert_rollout_max_steps: int = 500,
+        grad_monitor_every_updates: int = 100,
+        context_encode_batch_size: int = 32768,
+        actor_update_every: int = 1,
+        gradient_scale_ema_beta: float = 0.95,
+        gradient_scale_min: float = 1.0,
+        gradient_scale_max: float = 100000.0,
+        gradient_scale_rate_limit: float = 2.0,
+        reference_actor_path: str | Path | None = None,
+    ) -> None:
+        """Freeze the Stage-I representation and install the immutable base actor."""
+        self._pace_enabled = True
+        self._pace_lambda_con = float(lambda_con)
+        self._pace_fixed_goal_steps = int(fixed_goal_steps)
+        self._pace_expert_rollout_max_steps = int(expert_rollout_max_steps)
+        self._pace_grad_monitor_every_updates = int(grad_monitor_every_updates)
+        self._pace_context_encode_batch_size = int(context_encode_batch_size)
+        self._pace_actor_update_every = int(actor_update_every)
+        self._pace_gradient_scale_ema_beta = float(gradient_scale_ema_beta)
+        self._pace_gradient_scale_min = float(gradient_scale_min)
+        self._pace_gradient_scale_max = float(gradient_scale_max)
+        self._pace_gradient_scale_rate_limit = float(gradient_scale_rate_limit)
+        self._pace_actor_base_lrs = [float(self.cfg.train.lr_actor) for _ in self.actor_optimizer.param_groups]
+        self._pace_reference_actor = copy.deepcopy(self._model._actor).to(self.device)
+        if reference_actor_path is not None:
+            state = safetensors.torch.load_file(str(reference_actor_path), device=str(self.device))
+            self._pace_reference_actor.load_state_dict(state, strict=True)
+        self._pace_reference_actor.eval().requires_grad_(False)
+        for module in (
+            self._model._backward_map,
+            self._model._target_backward_map,
+            self._model._obs_normalizer,
+        ):
+            module.eval().requires_grad_(False)
+        self.set_train_mode(True)
+
+    def set_train_mode(self, training: bool = True) -> None:
+        self._model.train(training)
+        if self.backward_frozen:
+            self._model._backward_map.eval()
+            self._model._target_backward_map.eval()
+            self._model._obs_normalizer.eval()
+        if self._pace_enabled:
+            if self._pace_reference_actor is not None:
+                self._pace_reference_actor.eval()
+
+    def set_pace_lambda(self, value: float) -> None:
+        self._pace_lambda_con = float(value)
+
+    def set_pace_runtime_metrics(self, metrics: dict[str, float]) -> None:
+        self._pace_runtime_metrics = dict(metrics)
+
+    def set_pace_actor_schedule(
+        self,
+        *,
+        enabled: bool,
+        lr_multiplier: float,
+        acquisition_loss_weight: float = 1.0,
+    ) -> None:
+        """Apply the Stage-II actor warmup/ramp and retention-recovery controls."""
+        if not self._pace_enabled:
+            return
+        if not 0.0 <= float(lr_multiplier) <= 1.0:
+            raise ValueError("PACE actor lr_multiplier must lie in [0, 1]")
+        if not 0.0 <= float(acquisition_loss_weight) <= 1.0:
+            raise ValueError("PACE acquisition_loss_weight must lie in [0, 1]")
+        self._pace_actor_updates_enabled = bool(enabled)
+        self._pace_actor_lr_multiplier = float(lr_multiplier)
+        self._pace_acquisition_loss_weight = float(acquisition_loss_weight)
+        if len(self._pace_actor_base_lrs) != len(self.actor_optimizer.param_groups):
+            raise RuntimeError("PACE actor optimizer parameter groups changed after initialization")
+        for group, base_lr in zip(self.actor_optimizer.param_groups, self._pace_actor_base_lrs, strict=True):
+            group["lr"] = base_lr * self._pace_actor_lr_multiplier
+
+    def pace_checkpoint_state(self) -> dict[str, tp.Any]:
+        """Return small calibration state needed for a numerically continuous resume."""
+        return {
+            "update_count": int(self._pace_update_count),
+            "consolidation_scale": float(self._pace_consolidation_scale),
+            "grad_acquisition_ema": float(self._pace_grad_acquisition_ema),
+            "grad_consolidation_ema": float(self._pace_grad_consolidation_ema),
+            "grad_ema_initialized": bool(self._pace_grad_ema_initialized),
+            "grad_cosine": float(self._pace_grad_cosine),
+        }
+
+    def load_pace_checkpoint_state(self, state: dict[str, tp.Any] | None) -> None:
+        if not state:
+            return
+        self._pace_update_count = int(state.get("update_count", 0))
+        self._pace_consolidation_scale = float(state.get("consolidation_scale", 1.0))
+        self._pace_grad_acquisition_ema = float(state.get("grad_acquisition_ema", 0.0))
+        self._pace_grad_consolidation_ema = float(state.get("grad_consolidation_ema", 0.0))
+        self._pace_grad_ema_initialized = bool(state.get("grad_ema_initialized", False))
+        self._pace_grad_cosine = float(state.get("grad_cosine", 0.0))
 
     @property
     def optimizer_dict(self):
@@ -271,14 +415,20 @@ class FBAgent:
 
         # optimize FB
         self.forward_optimizer.zero_grad(set_to_none=True)
-        self.backward_optimizer.zero_grad(set_to_none=True)
+        if not self.backward_frozen:
+            self.backward_optimizer.zero_grad(set_to_none=True)
         fb_loss.backward()
-        average_gradients((*self._model._forward_map.parameters(), *self._model._backward_map.parameters()))
+        if self.backward_frozen:
+            average_gradients(self._model._forward_map.parameters())
+        else:
+            average_gradients((*self._model._forward_map.parameters(), *self._model._backward_map.parameters()))
         if clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(self._model._forward_map.parameters(), clip_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self._model._backward_map.parameters(), clip_grad_norm)
+            if not self.backward_frozen:
+                torch.nn.utils.clip_grad_norm_(self._model._backward_map.parameters(), clip_grad_norm)
         self.forward_optimizer.step()
-        self.backward_optimizer.step()
+        if not self.backward_frozen:
+            self.backward_optimizer.step()
 
         with torch.no_grad():
             output_metrics = {
@@ -347,14 +497,263 @@ class FBAgent:
     
     def _sample_tracking_z(self, replay_buffer, batch_dim, traj_length):
         batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length)  # N*T x obs_dim
-        z = self._model.backward_map(batch["next"]["observation"])  # NT x z_dim
+        next_obs = tree_map(lambda x: x.to(self.device), batch["next"]["observation"])
+        z = self._model.backward_map(next_obs)  # NT x z_dim
         z = z.view(batch_dim, traj_length, z.shape[-1])  # N x T x z_dim
         for step in range(traj_length):
             end_idx = min(step + self.cfg.model.seq_length, traj_length)
             z[:, step] = z[:, step:end_idx].mean(dim=1)
         return self._model.project_z(z)  # N x T x z_dim
 
-    def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None) -> torch.Tensor:
+    @torch.no_grad()
+    def _encode_pace_fixed_windows(self, observations) -> torch.Tensor:
+        batch_size = next(iter(observations.values())).shape[0]
+        seq_length = next(iter(observations.values())).shape[1]
+        flattened = tree_map(
+            lambda value: value.reshape(batch_size * seq_length, *value.shape[2:]).to(self.device),
+            observations,
+        )
+        embeddings = self._model.backward_map(flattened).reshape(batch_size, seq_length, -1)
+        return self._model.project_z(embeddings.mean(dim=1))
+
+    @torch.no_grad()
+    def _reset_pace_contexts(self, reset_ids: torch.Tensor, replay_buffer, rollout_metadata: dict[str, torch.Tensor]) -> None:
+        expert_buffer = replay_buffer["expert_slicer"]
+        acquisition = rollout_metadata["acquisition"].to(self.device).bool()
+        global_motion_ids = rollout_metadata["global_motion_ids"].to(self.device).long()
+        start_steps = rollout_metadata["motion_start_steps"].to(self.device).long()
+        segment_lengths = rollout_metadata["segment_lengths"].to(self.device).long()
+        seq_length = int(self.cfg.model.seq_length)
+
+        acquisition_ids = reset_ids[acquisition[reset_ids]]
+        if acquisition_ids.numel() > 0:
+            sequences = []
+            lengths = []
+            for env_id in acquisition_ids.tolist():
+                length = int(segment_lengths[env_id].item())
+                motion_id = int(global_motion_ids[env_id].item())
+                start = int(start_steps[env_id].item())
+                sequences.append(
+                    expert_buffer.observation_sequence(
+                        motion_id,
+                        start,
+                        length,
+                        next_offset=1,
+                    )
+                )
+                lengths.append(length)
+            concatenated = tree_map(lambda *values: torch.cat(values, dim=0), *sequences)
+            del sequences
+            total_observations = next(iter(concatenated.values())).shape[0]
+            encoded_parts = []
+            for batch_start in range(0, total_observations, self._pace_context_encode_batch_size):
+                batch_end = min(batch_start + self._pace_context_encode_batch_size, total_observations)
+                observation_batch = tree_map(
+                    lambda value: value[batch_start:batch_end].to(self.device),
+                    concatenated,
+                )
+                encoded_parts.append(self._model.backward_map(observation_batch))
+            encoded = torch.cat(encoded_parts, dim=0)
+            cursor = 0
+            embeddings_by_length: dict[int, list[torch.Tensor]] = {}
+            envs_by_length: dict[int, list[int]] = {}
+            for env_id, length in zip(acquisition_ids.tolist(), lengths):
+                sequence_embeddings = encoded[cursor : cursor + length]
+                cursor += length
+                embeddings_by_length.setdefault(length, []).append(sequence_embeddings)
+                envs_by_length.setdefault(length, []).append(env_id)
+                self._pace_tracking_lengths[env_id] = length
+            # Use the same complete next-state sequence as evaluation. Near the
+            # tail, shorten the look-ahead window instead of dropping the last
+            # seq_length - 1 transitions.
+            for length, embedding_list in embeddings_by_length.items():
+                stacked_embeddings = torch.stack(embedding_list, dim=0)
+                prefix = torch.cat(
+                    [
+                        torch.zeros_like(stacked_embeddings[:, :1]),
+                        torch.cumsum(stacked_embeddings, dim=1),
+                    ],
+                    dim=1,
+                )
+                starts = torch.arange(length, device=self.device)
+                ends = torch.clamp(starts + seq_length, max=length)
+                rolling = (prefix[:, ends] - prefix[:, starts]) / (ends - starts).view(1, -1, 1)
+                rolling = self._model.project_z(rolling)
+                env_ids = torch.tensor(envs_by_length[length], device=self.device, dtype=torch.long)
+                self._pace_tracking_z[env_ids, :length] = rolling
+
+        consolidation_ids = reset_ids[~acquisition[reset_ids]]
+        if consolidation_ids.numel() > 0:
+            windows = []
+            for env_id in consolidation_ids.tolist():
+                windows.append(
+                    expert_buffer.observation_sequence(
+                        int(global_motion_ids[env_id].item()),
+                        int(start_steps[env_id].item()),
+                        seq_length,
+                        next_offset=1,
+                    )
+                )
+            stacked = tree_map(lambda *values: torch.stack(values, dim=0), *windows)
+            self._pace_fixed_z[consolidation_ids] = self._encode_pace_fixed_windows(stacked)
+
+    @torch.no_grad()
+    def _maybe_update_pace_rollout_context(
+        self,
+        z: torch.Tensor | None,
+        step_count: torch.Tensor,
+        replay_buffer,
+        rollout_metadata: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        steps = step_count.reshape(-1).to(self.device).long()
+        num_envs = int(steps.numel())
+        z_dim = int(self.cfg.model.archi.z_dim)
+        if self._pace_tracking_z is None or self._pace_tracking_z.shape[0] != num_envs:
+            required_steps = max(int(rollout_metadata["max_segment_length"].item()), 1)
+            self._pace_tracking_z = torch.zeros(
+                num_envs,
+                required_steps,
+                z_dim,
+                device=self.device,
+            )
+            self._pace_tracking_lengths = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+            self._pace_fixed_z = torch.zeros(num_envs, z_dim, device=self.device)
+            z = None
+        context = torch.zeros(num_envs, z_dim, device=self.device) if z is None else z.to(self.device).clone()
+        reset_ids = torch.arange(num_envs, device=self.device) if z is None else (steps == 0).nonzero(as_tuple=False).flatten()
+        if reset_ids.numel() > 0:
+            self._reset_pace_contexts(reset_ids, replay_buffer, rollout_metadata)
+
+        acquisition = rollout_metadata["acquisition"].to(self.device).bool()
+        acquisition_ids = acquisition.nonzero(as_tuple=False).flatten()
+        if acquisition_ids.numel() > 0:
+            offsets = steps[acquisition_ids]
+            lengths = self._pace_tracking_lengths[acquisition_ids]
+            if torch.any(offsets >= lengths):
+                bad = acquisition_ids[offsets >= lengths].tolist()
+                raise RuntimeError(f"PACE acquisition context exceeded its aligned expert segment for envs {bad[:10]}")
+            context[acquisition_ids] = self._pace_tracking_z[acquisition_ids, offsets]
+
+        consolidation_ids = (~acquisition).nonzero(as_tuple=False).flatten()
+        if consolidation_ids.numel() > 0:
+            refresh = consolidation_ids[
+                (steps[consolidation_ids] > 0)
+                & (steps[consolidation_ids] % self._pace_fixed_goal_steps == 0)
+            ]
+            if refresh.numel() > 0:
+                windows = replay_buffer["expert_slicer"].sample_observation_windows(
+                    batch_size=int(refresh.numel()),
+                    seq_length=int(self.cfg.model.seq_length),
+                )
+                self._pace_fixed_z[refresh] = self._encode_pace_fixed_windows(windows)
+            context[consolidation_ids] = self._pace_fixed_z[consolidation_ids]
+        return context
+
+    @torch.no_grad()
+    def _reset_aligned_tracking_contexts(
+        self,
+        reset_ids: torch.Tensor,
+        replay_buffer,
+        rollout_metadata: dict[str, torch.Tensor],
+    ) -> None:
+        expert = rollout_metadata["expert_rollout"].to(self.device).bool()
+        expert_ids = reset_ids[expert[reset_ids]]
+        if expert_ids.numel() == 0:
+            return
+        motion_ids = rollout_metadata["global_motion_ids"].to(self.device).long()
+        starts = rollout_metadata["motion_start_steps"].to(self.device).long()
+        lengths = rollout_metadata["segment_lengths"].to(self.device).long()
+        seq_length = int(self.cfg.model.seq_length)
+        expert_buffer = replay_buffer["expert_slicer"]
+        sequences = []
+        sequence_lengths = []
+        for env_id in expert_ids.tolist():
+            length = int(lengths[env_id].item())
+            sequences.append(
+                expert_buffer.observation_sequence(
+                    int(motion_ids[env_id].item()),
+                    int(starts[env_id].item()),
+                    length,
+                    next_offset=1,
+                )
+            )
+            sequence_lengths.append(length)
+        concatenated = tree_map(lambda *values: torch.cat(values, dim=0), *sequences)
+        encoded_parts = []
+        total = next(iter(concatenated.values())).shape[0]
+        batch_size = int(getattr(self, "_pace_context_encode_batch_size", 32768))
+        for begin in range(0, total, batch_size):
+            part = tree_map(lambda value: value[begin : begin + batch_size].to(self.device), concatenated)
+            encoded_parts.append(self._model.backward_map(part))
+        encoded = torch.cat(encoded_parts, dim=0)
+        cursor = 0
+        for env_id, length in zip(expert_ids.tolist(), sequence_lengths, strict=True):
+            embeddings = encoded[cursor : cursor + length]
+            cursor += length
+            prefix = torch.cat((torch.zeros_like(embeddings[:1]), embeddings.cumsum(dim=0)), dim=0)
+            starts_idx = torch.arange(length, device=self.device)
+            ends = torch.clamp(starts_idx + seq_length, max=length)
+            rolling = (prefix[ends] - prefix[starts_idx]) / (ends - starts_idx).unsqueeze(-1)
+            self._pace_tracking_z[env_id, :length] = self._model.project_z(rolling)
+            self._pace_tracking_lengths[env_id] = length
+
+    @torch.no_grad()
+    def _maybe_update_aligned_tracking_context(
+        self,
+        z: torch.Tensor | None,
+        step_count: torch.Tensor,
+        replay_buffer,
+        rollout_metadata: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        steps = step_count.reshape(-1).to(self.device).long()
+        num_envs = int(steps.numel())
+        z_dim = int(self.cfg.model.archi.z_dim)
+        if self._pace_tracking_z is None or self._pace_tracking_z.shape[0] != num_envs:
+            required_steps = max(int(rollout_metadata["max_segment_length"].item()), 1)
+            self._pace_tracking_z = torch.zeros(num_envs, required_steps, z_dim, device=self.device)
+            self._pace_tracking_lengths = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+            z = None
+        context = self._model.sample_z(num_envs, device=self.device) if z is None else z.to(self.device).clone()
+        expert = rollout_metadata["expert_rollout"].to(self.device).bool()
+        nonexpert = ~expert
+        if z is not None and bool(nonexpert.any()):
+            refresh = nonexpert & (steps % int(self.cfg.train.update_z_every_step) == 0)
+            if bool(refresh.any()):
+                count = int(refresh.sum().item())
+                if self.cfg.train.use_mix_rollout and not self.z_buffer.empty():
+                    replacement = self.z_buffer.sample(count, device=self.device)
+                else:
+                    replacement = self._model.sample_z(count, device=self.device)
+                context[refresh] = replacement
+        reset_ids = torch.arange(num_envs, device=self.device) if z is None else (steps == 0).nonzero(as_tuple=False).flatten()
+        if reset_ids.numel() > 0:
+            self._reset_aligned_tracking_contexts(reset_ids, replay_buffer, rollout_metadata)
+        expert_ids = expert.nonzero(as_tuple=False).flatten()
+        if expert_ids.numel() > 0:
+            offsets = steps[expert_ids]
+            lengths = self._pace_tracking_lengths[expert_ids]
+            if torch.any(offsets >= lengths):
+                bad = expert_ids[offsets >= lengths][:10].tolist()
+                raise RuntimeError(f"Aligned tracking context exceeded its expert segment for envs {bad}")
+            context[expert_ids] = self._pace_tracking_z[expert_ids, offsets]
+        self.env_idx_with_expert_rollout = expert_ids
+        return context
+
+    def maybe_update_rollout_context(
+        self,
+        z: torch.Tensor | None,
+        step_count: torch.Tensor,
+        replay_buffer: None = None,
+        rollout_metadata: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if self._pace_enabled:
+            if replay_buffer is None or rollout_metadata is None:
+                raise RuntimeError("PACE rollout requires the expert buffer and aligned environment metadata")
+            return self._maybe_update_pace_rollout_context(z, step_count, replay_buffer, rollout_metadata)
+        if bool(getattr(self.cfg.model, "use_tracking_critic", False)):
+            if replay_buffer is None or rollout_metadata is None:
+                raise RuntimeError("Tracking Q requires the expert buffer and aligned rollout metadata")
+            return self._maybe_update_aligned_tracking_context(z, step_count, replay_buffer, rollout_metadata)
         # get mask for environmets where we need to change z
         if z is not None:
             mask_reset_z = step_count % self.cfg.train.update_z_every_step == 0
@@ -409,6 +808,7 @@ class FBAgent:
         safetensors.torch.load_model(agent._model, path / "model/model.safetensors", device=device, strict=False)
         agent._model.train()
         agent._model.requires_grad_(True)
+        agent.apply_training_freezes()
         return agent
 
     def save(self, output_folder: str) -> None:
@@ -426,6 +826,13 @@ class FBAgent:
         model_folder = output_folder / "model"
         model_folder.mkdir(exist_ok=True)
         self._model.save(output_folder=str(model_folder))
+        if self._pace_enabled:
+            if self._pace_reference_actor is None:
+                raise RuntimeError("PACE is enabled but the reference actor is missing")
+            safetensors.torch.save_file(
+                self._pace_reference_actor.state_dict(),
+                str(output_folder / PACE_REFERENCE_ACTOR_FILENAME),
+            )
 
         # Save the arguments required to create this agent (in addition to the config)
         init_kwargs = {

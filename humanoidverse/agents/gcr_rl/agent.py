@@ -305,7 +305,8 @@ class GcrRlAgent:
     @torch.no_grad()
     def _sample_tracking_z(self, replay_buffer, batch_dim: int, traj_length: int) -> torch.Tensor:
         batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length)
-        z = self._model.goal_inference(batch["next"]["observation"])
+        next_obs = tree_map(lambda x: x.to(self.device), batch["next"]["observation"])
+        z = self._model.goal_inference(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
         for step in range(traj_length):
             end_idx = min(step + self.cfg.model.seq_length, traj_length)

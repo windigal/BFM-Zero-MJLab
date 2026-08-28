@@ -198,23 +198,48 @@ class MotionLibBase():
         self._sampling_history = torch.zeros(self._num_unique_motions).to(self._device)
         self._motion_source_ids = torch.tensor(self._motion_source_ids_np, device=self._device, dtype=torch.long)
         self._sampling_prob = self._source_mixed_prob(torch.ones(self._num_unique_motions, device=self._device))
+        self._emd_group_ids = None
+        self._emd_group_weights = None
+        self._global_emd_sampling = False
         mix_summary = ", ".join(
             f"{name}:{float(weight):.4f}/n={int((self._motion_source_ids == idx).sum().item())}"
             for idx, (name, weight) in enumerate(zip(self._motion_source_names, self._motion_source_weights))
         )
         logger.info(f"Motion source mix: {mix_summary}")
 
-    def _source_counts(self, n, weights, exact_counts):
+    def _source_counts(self, n, weights, exact_counts, *, ensure_nonzero=False):
         if exact_counts:
             expected = weights * int(n)
             counts = torch.floor(expected).to(torch.long)
             remainder = int(n) - int(counts.sum().item())
             if remainder > 0:
-                order = torch.argsort(expected - counts.to(expected.dtype), descending=True)
+                # Randomize only equal-fraction ties so an indivisible slot does
+                # not systematically favor the lowest-numbered group/source.
+                tie_order = torch.randperm(len(weights), device=weights.device)
+                order = tie_order[
+                    torch.argsort(
+                        (expected - counts.to(expected.dtype))[tie_order],
+                        descending=True,
+                        stable=True,
+                    )
+                ]
                 counts[order[:remainder]] += 1
-            return counts
-        source_samples = torch.multinomial(weights, num_samples=int(n), replacement=True)
-        return torch.bincount(source_samples, minlength=len(weights))
+        else:
+            source_samples = torch.multinomial(weights, num_samples=int(n), replacement=True)
+            counts = torch.bincount(source_samples, minlength=len(weights))
+
+        positive = weights > 0
+        if ensure_nonzero and int(n) >= int(positive.sum().item()):
+            for missing_idx in (positive & (counts == 0)).nonzero(as_tuple=False).flatten().tolist():
+                donors = (positive & (counts > 1)).nonzero(as_tuple=False).flatten()
+                if donors.numel() == 0:
+                    raise RuntimeError("Unable to reserve one slot for every non-empty sampling group")
+                expected = weights * int(n)
+                surplus = counts[donors].to(expected.dtype) - expected[donors]
+                donor_idx = int(donors[torch.argmax(surplus)].item())
+                counts[donor_idx] -= 1
+                counts[missing_idx] += 1
+        return counts
 
     def _source_mixed_prob(self, priorities):
         priorities = torch.as_tensor(priorities, device=self._device, dtype=torch.float32)
@@ -244,7 +269,18 @@ class MotionLibBase():
     def _refresh_sampling_batch_prob(self):
         if self._curr_motion_ids is None:
             return
-        batch_prob = self._sampling_prob[self._curr_motion_ids]
+        # A partial global-EMD pool is already an importance sample from the
+        # target distribution. Re-weighting its slots a second time would
+        # approximately square the intended probabilities. Reuse those slots
+        # uniformly; if every unique motion is resident, retain direct weights.
+        partial_global_emd_pool = (
+            self._global_emd_sampling
+            and len(self._curr_motion_ids) < self._num_unique_motions
+        )
+        if self._emd_group_ids is not None or partial_global_emd_pool:
+            batch_prob = torch.ones(len(self._curr_motion_ids), device=self._device, dtype=torch.float32)
+        else:
+            batch_prob = self._sampling_prob[self._curr_motion_ids]
         total = batch_prob.sum()
         if not torch.isfinite(total) or float(total) <= 0.0:
             batch_prob = torch.ones_like(batch_prob)
@@ -286,6 +322,102 @@ class MotionLibBase():
         if sample_idxes.numel() != int(n):
             raise RuntimeError(f"Source-stratified sampler produced {sample_idxes.numel()} samples, expected {n}")
         return sample_idxes[torch.randperm(sample_idxes.numel(), device=self._device)]
+
+    def _sample_indices_with_emd_groups(self, n: int, *, exact_counts: bool) -> torch.Tensor:
+        if self._emd_group_ids is None or self._emd_group_weights is None:
+            raise RuntimeError("EMD group sampling has not been configured")
+        counts = self._source_counts(
+            n,
+            self._emd_group_weights,
+            exact_counts=exact_counts,
+            ensure_nonzero=True,
+        )
+        sampled = []
+        for group_id, count in enumerate(counts.tolist()):
+            if count <= 0:
+                continue
+            candidate_ids = (self._emd_group_ids == group_id).nonzero(as_tuple=False).flatten()
+            if candidate_ids.numel() == 0:
+                raise RuntimeError(f"EMD group {group_id} received {count} slots but contains no trajectories")
+            group_prob = self._sampling_prob[candidate_ids]
+            group_prob = group_prob / group_prob.sum()
+            # A training pool is reused for many resets. Draw without replacement
+            # in cycles so its slots cover as many distinct trajectories as the
+            # group size allows, while retaining EMD-weighted selection within
+            # every partial cycle.
+            group_samples = []
+            remaining = count
+            while remaining > 0:
+                cycle_size = min(remaining, int(candidate_ids.numel()))
+                local_samples = torch.multinomial(group_prob, num_samples=cycle_size, replacement=False)
+                group_samples.append(candidate_ids[local_samples])
+                remaining -= cycle_size
+            sampled.append(torch.cat(group_samples))
+        sample_idxes = torch.cat(sampled) if sampled else torch.empty(0, device=self._device, dtype=torch.long)
+        if sample_idxes.numel() != int(n):
+            raise RuntimeError(f"EMD group sampler produced {sample_idxes.numel()} samples, expected {n}")
+        return sample_idxes[torch.randperm(sample_idxes.numel(), device=self._device)]
+
+    @property
+    def num_motion_sources(self) -> int:
+        return len(self._motion_source_names)
+
+    def set_emd_group_sampling(
+        self,
+        probabilities: torch.Tensor,
+        group_ids: torch.Tensor,
+        group_weights: torch.Tensor,
+    ) -> None:
+        """Install a single-source EMD-group distribution for future training-pool reloads."""
+        if self.num_motion_sources != 1:
+            raise ValueError("EMD group sampling is only supported for a single logical motion source")
+        probabilities = torch.as_tensor(probabilities, device=self._device, dtype=torch.float32)
+        group_ids = torch.as_tensor(group_ids, device=self._device, dtype=torch.long)
+        group_weights = torch.as_tensor(group_weights, device=self._device, dtype=torch.float32)
+        if probabilities.shape != (self._num_unique_motions,):
+            raise ValueError(f"Expected {self._num_unique_motions} probabilities, got {tuple(probabilities.shape)}")
+        if group_ids.shape != probabilities.shape:
+            raise ValueError("EMD group ids must have one entry per trajectory")
+        if group_weights.ndim != 1 or group_weights.numel() == 0:
+            raise ValueError("EMD group weights must be a non-empty one-dimensional tensor")
+        if torch.any(group_ids < 0) or torch.any(group_ids >= group_weights.numel()):
+            raise ValueError(f"EMD group ids must be in [0, {group_weights.numel() - 1}]")
+        if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0) or float(probabilities.sum()) <= 0:
+            raise ValueError("EMD trajectory probabilities must be finite, non-negative, and sum to a positive value")
+        if not torch.isfinite(group_weights).all() or torch.any(group_weights < 0) or float(group_weights.sum()) <= 0:
+            raise ValueError("EMD group probabilities must be finite and non-negative")
+        probabilities = probabilities / probabilities.sum()
+        group_weights = group_weights / group_weights.sum()
+        for group_id in range(group_weights.numel()):
+            has_members = bool((group_ids == group_id).any())
+            if (float(group_weights[group_id]) > 0) != has_members:
+                raise ValueError(f"EMD group {group_id} membership does not match its group probability")
+        self._sampling_prob = probabilities
+        self._emd_group_ids = group_ids
+        self._emd_group_weights = group_weights
+        self._global_emd_sampling = False
+        self.all_motions_loaded = False
+        self._refresh_sampling_batch_prob()
+
+    def set_global_emd_sampling(self, probabilities: torch.Tensor) -> None:
+        """Install one normalized EMD-weighted distribution over all trajectories."""
+        if self.num_motion_sources != 1:
+            raise ValueError("Global EMD sampling is only supported for a single logical motion source")
+        probabilities = torch.as_tensor(probabilities, device=self._device, dtype=torch.float32)
+        if probabilities.shape != (self._num_unique_motions,):
+            raise ValueError(f"Expected {self._num_unique_motions} probabilities, got {tuple(probabilities.shape)}")
+        if (
+            not torch.isfinite(probabilities).all()
+            or torch.any(probabilities < 0)
+            or float(probabilities.sum()) <= 0
+        ):
+            raise ValueError("Global EMD probabilities must be finite, non-negative, and sum to a positive value")
+        self._sampling_prob = probabilities / probabilities.sum()
+        self._emd_group_ids = None
+        self._emd_group_weights = None
+        self._global_emd_sampling = True
+        self.all_motions_loaded = False
+        self._refresh_sampling_batch_prob()
         
     def update_soft_sampling_weight(self, failed_keys):
         # Sampling weight based on evaluation, mostly training on failed sequences.
@@ -473,12 +605,17 @@ class MotionLibBase():
         if max_num_seqs is not None:
             assert max_num_seqs <= self.num_envs
             
-        if self.all_motions_loaded:
+        if self.all_motions_loaded and self._emd_group_ids is None:
             print("All motions already loaded!!! No need to resample.")
             return
         
         if self.m_cfg.get("override_num_motions_to_load", None) is not None:
             max_num_seqs = self.m_cfg.override_num_motions_to_load
+        if self._emd_group_ids is not None:
+            max_num_seqs = self.num_envs if max_num_seqs is None else int(max_num_seqs)
+            self.all_motions_loaded = False
+            self.load_motions(random_sample=True, num_motions_to_load=max_num_seqs)
+            return
         if max_num_seqs is None: # if not specified, load all motions, can OOM if the dataset is too large. 
             max_num_seqs = self._num_unique_motions
             self.all_motions_loaded = True
@@ -511,7 +648,8 @@ class MotionLibBase():
                      random_sample=True, 
                      start_idx=0, 
                      max_len=-1, 
-                     target_heading = None, num_motions_to_load = None):
+                     target_heading = None, num_motions_to_load = None,
+                     motion_ids=None):
         
         if "gts" in self.__dict__:
             del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs, self.dof_pos
@@ -537,10 +675,20 @@ class MotionLibBase():
         else:
             num_motion_to_load = num_motions_to_load
 
-        if random_sample:
-            sample_idxes = self._sample_indices_with_source_mix(
-                self._sampling_prob, self._motion_source_ids, num_motion_to_load, exact_counts=True
-            )
+        if motion_ids is not None:
+            sample_idxes = torch.as_tensor(motion_ids, device=self._device, dtype=torch.long)
+            if sample_idxes.ndim != 1 or sample_idxes.numel() == 0:
+                raise ValueError("motion_ids must be a non-empty one-dimensional sequence")
+            if torch.any(sample_idxes < 0) or torch.any(sample_idxes >= self._num_unique_motions):
+                raise IndexError("motion_ids contains an out-of-range global motion id")
+            num_motion_to_load = int(sample_idxes.numel())
+        elif random_sample:
+            if self._emd_group_ids is not None:
+                sample_idxes = self._sample_indices_with_emd_groups(num_motion_to_load, exact_counts=True)
+            else:
+                sample_idxes = self._sample_indices_with_source_mix(
+                    self._sampling_prob, self._motion_source_ids, num_motion_to_load, exact_counts=True
+                )
         else: # start_idx only used for non-random sampling. 
             sample_idxes = torch.clamp(torch.arange(num_motion_to_load) + start_idx, max = self._num_unique_motions - 1 ).to(self._device)
         
@@ -583,6 +731,7 @@ class MotionLibBase():
         for i in track(range(len(jobs) - 1), "Gathering results..."):
             res = queue.get()
             res_acc.update(res)
+        manager.shutdown()
 
         
         for f in track(range(len(res_acc)), description="Processing motions..."):
@@ -769,12 +918,39 @@ class MotionLibBase():
         return motion_time.to(self._device)
     
     def sample_motions(self, n):
+        if self._emd_group_ids is not None:
+            return torch.randint(0, len(self._curr_motion_ids), (int(n),), device=self._device)
         source_ids = self._motion_source_ids[self._curr_motion_ids]
         motion_ids = self._sample_indices_with_source_mix(
             self._sampling_batch_prob, source_ids, n, exact_counts=False
         ).to(self._device)
 
         return motion_ids
+
+    def sample_motions_from_groups(self, requested_group_ids: torch.Tensor) -> torch.Tensor:
+        """Sample local motion-pool indices while preserving fixed PACE environment roles."""
+        if self._emd_group_ids is None or self._curr_motion_ids is None:
+            raise RuntimeError("PACE group sampling requires an installed EMD distribution and a loaded training pool")
+        requested_group_ids = torch.as_tensor(requested_group_ids, device=self._device, dtype=torch.long)
+        pool_groups = self._emd_group_ids[self._curr_motion_ids]
+        result = torch.empty_like(requested_group_ids)
+        for group_id in requested_group_ids.unique().tolist():
+            output_positions = (requested_group_ids == group_id).nonzero(as_tuple=False).flatten()
+            candidates = (pool_groups == group_id).nonzero(as_tuple=False).flatten()
+            if candidates.numel() == 0:
+                raise RuntimeError(f"Loaded training pool contains no PACE group {group_id} motion")
+            count = int(output_positions.numel())
+            if count <= int(candidates.numel()):
+                selected = candidates[torch.randperm(candidates.numel(), device=self._device)[:count]]
+            else:
+                selected = candidates[torch.randint(0, candidates.numel(), (count,), device=self._device)]
+            result[output_positions] = selected
+        return result
+
+    def global_motion_ids(self, local_motion_ids: torch.Tensor) -> torch.Tensor:
+        if self._curr_motion_ids is None:
+            raise RuntimeError("No motion pool is currently loaded")
+        return self._curr_motion_ids[torch.as_tensor(local_motion_ids, device=self._device, dtype=torch.long)]
     
 
     def get_motion_length(self, motion_ids=None):

@@ -20,6 +20,10 @@ def build_agent_preset(
     lr_scale: float,
     clip_grad_norm: float,
     cartwheel_aux_safe: bool,
+    enable_tracking_q: bool = False,
+    freeze_backward: bool = False,
+    tracking_actor_grad_ratio: float = 0.10,
+    disable_discriminator: bool = False,
     wandb_project: str,
     wandb_group: str = "mjlab",
 ) -> dict[str, Any]:
@@ -32,12 +36,18 @@ def build_agent_preset(
                 lr_scale=lr_scale,
                 clip_grad_norm=clip_grad_norm,
                 cartwheel_aux_safe=cartwheel_aux_safe,
+                enable_tracking_q=enable_tracking_q,
+                freeze_backward=freeze_backward,
+                tracking_actor_grad_ratio=tracking_actor_grad_ratio,
+                disable_discriminator=disable_discriminator,
             ),
             "wandb_group": wandb_group,
             "wandb_project": wandb_project,
             "train_runtime": dict(FB_TRAIN_RUNTIME),
         }
     if agent in {"tech", "tldr"}:
+        if enable_tracking_q or freeze_backward or disable_discriminator:
+            raise ValueError("Extreme-RGMT tracking Q is currently supported only by the fb preset")
         return {
             "agent_cfg": build_tech_agent(
                 device=device,

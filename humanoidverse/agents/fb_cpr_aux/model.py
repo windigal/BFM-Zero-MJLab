@@ -6,6 +6,7 @@
 import copy
 import typing as tp
 
+import gymnasium
 import torch
 from torch.amp import autocast
 
@@ -15,12 +16,14 @@ from ..nn_models import ForwardArchiConfig, RewardNormalizerConfig
 
 class FBcprAuxModelArchiConfig(FBcprModelArchiConfig):
     aux_critic: ForwardArchiConfig = ForwardArchiConfig()
+    tracking_critic: ForwardArchiConfig = ForwardArchiConfig()
 
 
 class FBcprAuxModelConfig(FBcprModelConfig):
     name: tp.Literal["FBcprAuxModel"] = "FBcprAuxModel"
     archi: FBcprAuxModelArchiConfig = FBcprAuxModelArchiConfig()
     norm_aux_reward: RewardNormalizerConfig = RewardNormalizerConfig()
+    use_tracking_critic: bool = False
 
     @property
     def object_class(self):
@@ -37,6 +40,20 @@ class FBcprAuxModel(FBcprModel):
         self.cfg = cfg
         self._aux_critic = cfg.archi.critic.build(obs_space, cfg.archi.z_dim, action_dim, output_dim=1)
         self._aux_reward_normalizer = cfg.norm_aux_reward.build()
+        if cfg.use_tracking_critic:
+            tracking_spaces = dict(obs_space.spaces)
+            tracking_spaces["reference_state"] = copy.deepcopy(obs_space.spaces["state"])
+            tracking_spaces["reference_privileged_state"] = copy.deepcopy(obs_space.spaces["privileged_state"])
+            self._tracking_obs_space = gymnasium.spaces.Dict(tracking_spaces)
+            self._tracking_critic = cfg.archi.tracking_critic.build(
+                self._tracking_obs_space,
+                cfg.archi.z_dim,
+                action_dim,
+                output_dim=1,
+            )
+        else:
+            self._tracking_obs_space = None
+            self._tracking_critic = None
 
         # make sure the model is in eval mode and never computes gradients
         self.train(False)
@@ -46,6 +63,9 @@ class FBcprAuxModel(FBcprModel):
     def _prepare_for_train(self) -> None:
         super()._prepare_for_train()
         self._target_aux_critic = copy.deepcopy(self._aux_critic)
+        self._target_tracking_critic = (
+            copy.deepcopy(self._tracking_critic) if self._tracking_critic is not None else None
+        )
 
     @torch.no_grad()
     def aux_critic(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, action: torch.Tensor):

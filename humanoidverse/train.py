@@ -13,12 +13,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from omegaconf import OmegaConf
 
 
 def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
     cache_dir = os.environ.get("UFO_CACHE_DIR") or os.environ.get("BFMZERO_MJLAB_CACHE_DIR")
-    root = Path(cache_dir or cache_root or Path.cwd() / "cache").expanduser()
+    root = Path(cache_dir or cache_root or Path.cwd() / "cache").expanduser().resolve()
     for key, subdir in {
         "TMPDIR": "tmp",
         "TEMP": "tmp",
@@ -28,9 +29,10 @@ def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
         "CUDA_CACHE_PATH": "cuda",
         "WARP_CACHE_PATH": "warp",
     }.items():
-        path = root / subdir
+        configured_path = os.environ.get(key)
+        path = Path(configured_path).expanduser().resolve() if configured_path else root / subdir
         path.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault(key, str(path))
+        os.environ[key] = str(path)
 
 
 _ensure_compile_cache()
@@ -59,7 +61,7 @@ AGENT_ALIASES = {
 from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from humanoidverse.agents.evaluations.humanoidverse_mjlab import HumanoidVerseMjlabTrackingEvaluationConfig
 from humanoidverse.agents.presets import build_agent_preset
-from humanoidverse.training.workspace import TrainConfig
+from humanoidverse.training.workspace import PACEConfig, TrainConfig
 from humanoidverse.utils.motion_data import prepare_motion_manifest
 from humanoidverse.utils.robot_spec import assert_robot_configs_compatible, load_robot_training_spec, resolve_robot_config_path
 
@@ -116,6 +118,14 @@ def build_ufo_mjlab_config(
     cartwheel_aux_safe: bool = False,
     num_agent_updates: int | None = None,
     robot_config: str | Path | None = None,
+    emd_group_low_threshold: float = 0.5,
+    emd_group_high_threshold: float = 2.0,
+    emd_high_group_fraction: float | None = None,
+    pace_base_checkpoint: str | Path | None = None,
+    tracking_q: bool = False,
+    init_checkpoint: str | Path | None = None,
+    tracking_actor_grad_ratio: float = 0.10,
+    disable_discriminator: bool = False,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
     robot_training = load_robot_training_spec(robot_config or DEFAULT_ROBOT_CONFIG)
@@ -131,7 +141,8 @@ def build_ufo_mjlab_config(
     except Exception as exc:
         print(f"WARNING: Could not inspect robot config metadata for draft status: {exc}", flush=True)
     evaluations = []
-    run_eval_and_prioritization = not smoke and not disable_eval_prioritization
+    pace_cfg = PACEConfig(base_checkpoint=str(Path(pace_base_checkpoint).expanduser().resolve())) if pace_base_checkpoint else None
+    run_eval_and_prioritization = pace_cfg is not None or (not smoke and not disable_eval_prioritization)
     distributed_sync = distributed_world_size > 1
     if run_eval_and_prioritization:
         evaluations = [
@@ -158,6 +169,10 @@ def build_ufo_mjlab_config(
         lr_scale=lr_scale,
         clip_grad_norm=clip_grad_norm,
         cartwheel_aux_safe=cartwheel_aux_safe,
+        enable_tracking_q=tracking_q,
+        freeze_backward=bool(tracking_q and init_checkpoint is not None),
+        tracking_actor_grad_ratio=tracking_actor_grad_ratio,
+        disable_discriminator=disable_discriminator,
         wandb_project=DEFAULT_WANDB_PROJECT,
         wandb_group=DEFAULT_WANDB_GROUP,
     )
@@ -169,6 +184,18 @@ def build_ufo_mjlab_config(
         if num_agent_updates <= 0:
             raise ValueError("num_agent_updates must be positive")
         train_runtime["num_agent_updates"] = int(num_agent_updates)
+    if pace_cfg is not None:
+        # Stage II starts from a trained policy. Fill one complete PACE horizon
+        # with policy rollouts, rather than the legacy random-action warmup.
+        train_runtime["num_seed_steps"] = int(num_envs * pace_cfg.rollout_horizon)
+        # FB-CPR's acquisition objective contains unnormalized Q values. PACE
+        # therefore uses a deliberately smaller actor LR in addition to the
+        # runtime warmup/ramp; critic, discriminator, and F learning rates stay
+        # unchanged so they can adapt to the Stage-II rollout distribution.
+        pace_agent_train = agent_cfg.train.model_copy(
+            update={"lr_actor": float(agent_cfg.train.lr_actor) * pace_cfg.actor_lr_scale}
+        )
+        agent_cfg = agent_cfg.model_copy(update={"train": pace_agent_train})
     hydra_overrides = [
         f"robot={robot_training.hydra_robot}",
         f"robot.control.action_scale={robot_training.action_scale}",
@@ -225,10 +252,14 @@ def build_ufo_mjlab_config(
         checkpoint_every_steps=checkpoint_every_steps,
         checkpoint_buffer=train_runtime["checkpoint_buffer"],
         prioritization=run_eval_and_prioritization,
-        prioritization_min_val=0.5,
-        prioritization_max_val=2.0,
+        prioritization_min_val=float(emd_group_low_threshold),
+        prioritization_max_val=float(emd_group_high_threshold),
         prioritization_scale=2.0,
         prioritization_mode="exp",
+        prioritization_high_group_ratio=0.80 if pace_cfg is not None else 0.05,
+        prioritization_high_group_fraction=(None if pace_cfg is not None else emd_high_group_fraction),
+        pace=pace_cfg,
+        init_checkpoint=(str(Path(init_checkpoint).expanduser().resolve()) if init_checkpoint else None),
         use_trajectory_buffer=train_runtime["use_trajectory_buffer"],
         buffer_size=int(buffer_size),
         use_wandb=use_wandb,
@@ -238,6 +269,7 @@ def build_ufo_mjlab_config(
         wandb_run_name=wandb_run_name or f"ufo_{agent}",
         load_expert_data_from_motion_lib=True,
         buffer_device="cuda" if device.startswith("cuda") else "cpu",
+        expert_buffer_device="cpu",
         disable_tqdm=True,
         evaluations=evaluations,
         eval_every_steps=train_runtime["eval_every_steps"],
@@ -253,22 +285,53 @@ def build_ufo_mjlab_config(
 
 
 def _select_device_and_rank(seed: int) -> tuple[str, int, int, int]:
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if cuda_visible == "":
-        try:
-            import torch
+    # torchrunx sets the distributed rank variables in each worker even when
+    # the parent shell has no CUDA_VISIBLE_DEVICES override.  Inspect them
+    # first; otherwise every worker falls through to the single-GPU shortcut
+    # below and tries to allocate on cuda:0.
+    del seed
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as exc:
+        raise RuntimeError("LOCAL_RANK, RANK, and WORLD_SIZE must be integers") from exc
+    if world_size < 1:
+        raise RuntimeError(f"WORLD_SIZE must be positive, got {world_size}")
+    if world_size > 1:
+        missing = [name for name in ("LOCAL_RANK", "RANK", "MASTER_ADDR", "MASTER_PORT") if name not in os.environ]
+        if missing:
+            raise RuntimeError(
+                "Incomplete distributed environment (missing "
+                + ", ".join(missing)
+                + "). Unset stale rank variables or launch through torchrunx/torchrun."
+            )
+        if not 0 <= rank < world_size:
+            raise RuntimeError(f"RANK must satisfy 0 <= RANK < WORLD_SIZE, got rank={rank}, world_size={world_size}")
+        if local_rank < 0:
+            raise RuntimeError(f"LOCAL_RANK must be non-negative, got {local_rank}")
+        import torch
 
-            if torch.cuda.is_available():
-                os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
-                return "cuda:0", 0, 0, 1
-        except Exception:
-            pass
-        return "cpu", 0, 0, 1
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
-    return f"cuda:{local_rank}", local_rank, rank, world_size
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed NCCL training requires CUDA, but torch.cuda.is_available() is False")
+        device_count = torch.cuda.device_count()
+        if local_rank >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is outside the {device_count} visible CUDA device(s)"
+            )
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
+        return f"cuda:{local_rank}", local_rank, rank, world_size
+
+    # Ignore stale single-process rank values and always select logical cuda:0.
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
+            return "cuda:0", 0, 0, 1
+    except Exception:
+        pass
+    return "cpu", 0, 0, 1
 
 
 def _init_distributed(local_rank: int, world_size: int) -> None:
@@ -375,6 +438,14 @@ def run_train(args: argparse.Namespace, log_dir: Path, log_dir_is_final: bool = 
         cartwheel_aux_safe=bool(args.cartwheel_aux_safe),
         num_agent_updates=args.num_agent_updates,
         robot_config=args.robot_config,
+        emd_group_low_threshold=args.emd_group_low_threshold,
+        emd_group_high_threshold=args.emd_group_high_threshold,
+        emd_high_group_fraction=args.emd_high_group_fraction,
+        pace_base_checkpoint=args.pace_base_checkpoint,
+        tracking_q=bool(args.tracking_q),
+        init_checkpoint=args.init_checkpoint,
+        tracking_actor_grad_ratio=args.tracking_actor_grad_ratio,
+        disable_discriminator=bool(args.disable_discriminator),
     )
     print(
         "[INFO] UFO train: "
@@ -385,6 +456,12 @@ def run_train(args: argparse.Namespace, log_dir: Path, log_dir_is_final: bool = 
         f"num_env_steps_global={args.num_env_steps}, buffer_size_per_rank={cfg.buffer_size}, "
         f"num_agent_updates={cfg.num_agent_updates}, update_agent_every_local={cfg.update_agent_every}, "
         f"cartwheel_aux_safe={args.cartwheel_aux_safe}, lr_scale={args.lr_scale}, clip_grad_norm={args.clip_grad_norm}, "
+        f"pace_base_checkpoint={args.pace_base_checkpoint}, "
+        f"tracking_q={args.tracking_q}, tracking_actor_grad_ratio={args.tracking_actor_grad_ratio}, "
+        f"disable_discriminator={args.disable_discriminator}, "
+        f"init_checkpoint={args.init_checkpoint}, "
+        "emd_sampling=global_all_trajectories, "
+        f"emd_weight_clamp=[{args.emd_group_low_threshold}, {args.emd_group_high_threshold}], "
         f"disable_dr={cfg.env.disable_domain_randomization}, disable_obs_noise={cfg.env.disable_obs_noise}, "
         f"compile={cfg.agent.compile}",
         flush=True,
@@ -438,7 +515,16 @@ def launch(args: argparse.Namespace) -> None:
     torchrunx.Launcher(
         hostnames=["localhost"],
         workers_per_host=num_gpus,
-        backend=None,
+        # Let torchrunx create the NCCL process group. torchrunx populates the
+        # standard rank variables for every backend; the explicit NCCL backend
+        # also initializes the collective group before run_train starts.
+        backend="nccl",
+        # The rank-0-only full-dataset tracking evaluation currently takes a
+        # little over ten minutes for 5k motions / 512 envs.  torchrunx creates
+        # the process group before run_train, so its default 600-second timeout
+        # wins over the two-hour timeout in _init_distributed and aborts the
+        # other ranks while they legitimately wait at the post-eval barrier.
+        worker_timeout=2 * 60 * 60,
         copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY
         + (
             "MUJOCO*",
@@ -531,9 +617,77 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Scale FB learning rates. TeCH preset ignores this value.")
     parser.add_argument("--clip-grad-norm", type=float, default=0.0, help="Enable FB actor/FB gradient clipping when > 0.")
     parser.add_argument(
+        "--emd-group-low-threshold",
+        type=float,
+        default=0.5,
+        help="Lower clamp used by global exponential EMD weighting.",
+    )
+    parser.add_argument(
+        "--emd-group-high-threshold",
+        type=float,
+        default=2.0,
+        help="Upper clamp used by global exponential EMD weighting.",
+    )
+    parser.add_argument(
+        "--emd-high-group-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Deprecated compatibility option. Single-dataset training now samples all trajectories from one "
+            "global EMD-weighted distribution and ignores high-EMD group fractions."
+        ),
+    )
+    parser.add_argument(
+        "--pace-base-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Enable PACE Stage-II training and initialize model weights from this Stage-I run or checkpoint directory. "
+            "Optimizers, replay, and global step start fresh."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-q",
+        action="store_true",
+        help=(
+            "Enable the Extreme-RGMT/BeyondMimic reference-tracking Q. Aligned expert environments "
+            "start from the exact first reference state and roll out the complete motion; the actor "
+            "observation interface is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-actor-grad-ratio",
+        type=float,
+        default=0.10,
+        help=(
+            "Target norm ratio of the weighted Tracking-Q actor gradient to the base actor gradient. "
+            "For example, 0.30 targets 30%%."
+        ),
+    )
+    parser.add_argument(
+        "--disable-discriminator",
+        action="store_true",
+        help=(
+            "Skip discriminator/critic training and drop the discriminator term from the actor loss. "
+            "Modules stay constructed so checkpoints remain compatible. Requires --tracking-q."
+        ),
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize model weights only from a run or checkpoint directory. Optimizers, replay, and "
+            "training counters start fresh. With --tracking-q, B/target-B/observation normalization are frozen."
+        ),
+    )
+    parser.add_argument(
         "--cartwheel-aux-safe",
         action="store_true",
-        help="Use a cartwheel-safe FB auxiliary reward set: remove locomotion contact/foot-shape penalties and reduce action-rate penalty.",
+        help=(
+            "Use a cartwheel-safe FB auxiliary reward set: remove undesired-contact, foot-orientation, "
+            "feet-heading, slippage, and ankle-roll penalties, and reduce action-rate penalties."
+        ),
     )
     parser.add_argument("--seed", type=int, default=4728)
     parser.add_argument("--use-wandb", action="store_true")
@@ -547,6 +701,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     raw_agent = args.agent
     args.agent = canonical_agent_name(args.agent)
+    if args.pace_base_checkpoint is not None and args.init_checkpoint is not None:
+        parser.error("--pace-base-checkpoint and --init-checkpoint are mutually exclusive")
+    if args.tracking_q and args.agent != "fb":
+        parser.error("--tracking-q is supported only with --agent fb")
+    if args.tracking_q and args.init_checkpoint is None and args.pace_base_checkpoint is None:
+        parser.error("--tracking-q requires --init-checkpoint (or --pace-base-checkpoint for later PACE use)")
+    if not np.isfinite(args.tracking_actor_grad_ratio) or args.tracking_actor_grad_ratio < 0.0:
+        parser.error("--tracking-actor-grad-ratio must be finite and non-negative")
+    if args.disable_discriminator and not args.tracking_q:
+        parser.error("--disable-discriminator requires --tracking-q (Stage-II tracking mode)")
+    if args.emd_high_group_fraction is not None and (
+        not np.isfinite(args.emd_high_group_fraction) or not 0 < args.emd_high_group_fraction < 1
+    ):
+        parser.error("--emd-high-group-fraction must be finite and strictly between 0 and 1")
     if raw_agent == "tldr":
         print("WARNING: agent=tldr is deprecated; use agent=tech instead.", file=sys.stderr, flush=True)
     if args.update_z_every_step is None:
@@ -590,8 +758,19 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--lr-scale must be positive")
     if args.clip_grad_norm < 0:
         raise ValueError("--clip-grad-norm must be non-negative")
+    if not np.isfinite(args.emd_group_low_threshold) or not np.isfinite(args.emd_group_high_threshold):
+        raise ValueError("EMD group thresholds must be finite")
+    if not 0 <= args.emd_group_low_threshold < args.emd_group_high_threshold:
+        raise ValueError("EMD group thresholds must satisfy 0 <= low < high")
     if args.cartwheel_aux_safe and args.agent != "fb":
         raise ValueError("--cartwheel-aux-safe is only supported with --agent fb")
+    if args.pace_base_checkpoint is not None:
+        if args.agent != "fb":
+            raise ValueError("--pace-base-checkpoint is only supported with --agent fb")
+        if args.disable_eval_prioritization:
+            raise ValueError("PACE cannot be combined with --disable-eval-prioritization")
+        if isinstance(args.data_path, list) and len(args.data_path) != 1:
+            raise ValueError("PACE requires exactly one complete motion dataset")
     return args
 
 

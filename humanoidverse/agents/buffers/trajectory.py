@@ -1,5 +1,6 @@
 import dataclasses
 import typing
+import warnings
 from collections.abc import Mapping
 from typing import Dict, List, Tuple, Union
 
@@ -96,6 +97,20 @@ class TrajectoryDictBuffer:
         )
         # set priorities to match the number of trajectories
         self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
+        self._motion_id_to_traj_idx = {int(motion_id): idx for idx, motion_id in enumerate(self.motion_ids)}
+        if len(self._motion_id_to_traj_idx) != len(self.motion_ids):
+            raise ValueError("Expert trajectory buffer contains duplicate motion ids")
+        max_motion_id = max((int(motion_id) for motion_id in self.motion_ids), default=-1)
+        self._motion_id_lookup = torch.full(
+            (max_motion_id + 1,),
+            -1,
+            dtype=torch.long,
+            device=self.lengths.device,
+        )
+        if self.motion_ids:
+            ids = torch.tensor(self.motion_ids, dtype=torch.long, device=self.lengths.device)
+            self._motion_id_lookup[ids] = torch.arange(len(ids), device=self.lengths.device)
+        self.pace_group_ids: torch.Tensor | None = None
         self._get_idxs = torch.compile(get_idxs, mode="reduce-overhead")
 
     def sample(self, batch_size: int = 1, seq_length: int | None = None):
@@ -137,6 +152,131 @@ class TrajectoryDictBuffer:
         assert len(priorities) == len(self.priorities)
         self.priorities[idxs] = priorities
         self.priorities = self.priorities / torch.sum(self.priorities)
+
+    def set_pace_sampling(self, probabilities: torch.Tensor, group_ids: torch.Tensor) -> None:
+        probabilities = torch.as_tensor(probabilities, device=self.priorities.device, dtype=torch.float32)
+        group_ids = torch.as_tensor(group_ids, device=self.priorities.device, dtype=torch.long)
+        if probabilities.shape != self.priorities.shape or group_ids.shape != self.priorities.shape:
+            raise ValueError("PACE expert probabilities and group ids must have one entry per trajectory")
+        if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0) or float(probabilities.sum()) <= 0:
+            raise ValueError("PACE expert probabilities must be finite, non-negative, and non-empty")
+        self.priorities = probabilities / probabilities.sum()
+        self.pace_group_ids = group_ids
+
+    def set_global_sampling(self, probabilities: torch.Tensor) -> None:
+        """Use one trajectory distribution and clear any legacy PACE groups."""
+        probabilities = torch.as_tensor(probabilities, device=self.priorities.device, dtype=torch.float32)
+        if probabilities.shape != self.priorities.shape:
+            raise ValueError("Global expert probabilities must have one entry per trajectory")
+        if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0) or float(probabilities.sum()) <= 0:
+            raise ValueError("Global expert probabilities must be finite, non-negative, and non-empty")
+        self.priorities = probabilities / probabilities.sum()
+        self.pace_group_ids = None
+
+    def motion_length(self, motion_id: int) -> int:
+        try:
+            traj_idx = self._motion_id_to_traj_idx[int(motion_id)]
+        except KeyError as exc:
+            raise KeyError(f"Unknown expert motion id {motion_id}") from exc
+        return int(self.lengths[traj_idx].item())
+
+    def observation_sequence(
+        self,
+        motion_id: int,
+        start_step: int,
+        num_steps: int,
+        *,
+        next_offset: int = 0,
+    ):
+        """Return an exact observation sequence from one global expert motion."""
+        traj_idx = self._motion_id_to_traj_idx[int(motion_id)]
+        length = int(self.lengths[traj_idx].item())
+        start_step = int(start_step)
+        num_steps = int(num_steps)
+        if start_step < 0 or num_steps <= 0 or start_step + next_offset + num_steps > length:
+            raise IndexError(
+                f"Expert window is out of bounds for motion_id={motion_id}: "
+                f"start={start_step}, offset={next_offset}, num_steps={num_steps}, length={length}"
+            )
+        storage_start = int(self.start_idx[traj_idx].reshape(-1)[0].item())
+        idxs = (storage_start + start_step + next_offset + torch.arange(num_steps, device=self.priorities.device)) % self.capacity
+        return tree_map(lambda value: value[idxs.to(value.device)], self.storage["observation"])
+
+    def observations_at(self, motion_ids: torch.Tensor, steps: torch.Tensor):
+        """Vectorized exact expert observations for global motion/frame ids."""
+        motion_ids = torch.as_tensor(motion_ids, dtype=torch.long, device="cpu").reshape(-1)
+        steps = torch.as_tensor(steps, dtype=torch.long, device="cpu").reshape(-1)
+        if motion_ids.shape != steps.shape:
+            raise ValueError("motion_ids and steps must have identical shapes")
+        lookup_ids = motion_ids.to(self._motion_id_lookup.device)
+        if torch.any(lookup_ids < 0) or torch.any(lookup_ids >= len(self._motion_id_lookup)):
+            bad = lookup_ids[(lookup_ids < 0) | (lookup_ids >= len(self._motion_id_lookup))][:10].tolist()
+            raise KeyError(f"Unknown expert motion ids {bad}")
+        traj_indices = self._motion_id_lookup[lookup_ids]
+        if torch.any(traj_indices < 0):
+            bad = lookup_ids[traj_indices < 0][:10].tolist()
+            raise KeyError(f"Unknown expert motion ids {bad}")
+        local_steps = steps.to(self.lengths.device)
+        lengths = self.lengths[traj_indices].reshape(-1)
+        if torch.any(local_steps < 0) or torch.any(local_steps >= lengths):
+            bad = ((local_steps < 0) | (local_steps >= lengths)).nonzero(as_tuple=False).flatten()[:10]
+            details = [(int(motion_ids[i]), int(steps[i]), int(lengths[i])) for i in bad.tolist()]
+            raise IndexError(f"Expert reference frame is out of bounds: (motion, step, length)={details}")
+        starts = self.start_idx[traj_indices].reshape(-1)
+        storage_indices = (starts + local_steps.to(starts.device)) % self.capacity
+        return tree_map(
+            lambda value: value.index_select(0, storage_indices.to(value.device)),
+            self.storage["observation"],
+        )
+
+    def sample_group_observation_windows(self, group_id: int, batch_size: int, seq_length: int):
+        if self.pace_group_ids is None:
+            raise RuntimeError("PACE expert groups have not been installed")
+        candidates = (self.pace_group_ids == int(group_id)) & (self.lengths >= int(seq_length) + 1)
+        candidate_idxs = candidates.nonzero(as_tuple=False).flatten()
+        if candidate_idxs.numel() == 0:
+            raise RuntimeError(f"PACE expert group {group_id} has no trajectory long enough for {seq_length} frames")
+        probabilities = self.priorities[candidate_idxs]
+        probabilities = probabilities / probabilities.sum()
+        chosen = candidate_idxs[torch.multinomial(probabilities, int(batch_size), replacement=True)]
+        windows = []
+        for traj_idx in chosen.tolist():
+            length = int(self.lengths[traj_idx].item())
+            max_start = length - int(seq_length) - 1
+            start = int(torch.randint(0, max_start + 1, (1,), device=self.priorities.device).item())
+            windows.append(
+                self.observation_sequence(
+                    self.motion_ids[traj_idx],
+                    start,
+                    int(seq_length),
+                    next_offset=1,
+                )
+            )
+        return tree_map(lambda *values: torch.stack(values, dim=0), *windows)
+
+    def sample_observation_windows(self, batch_size: int, seq_length: int):
+        """Sample fixed-goal windows from the full EMD-weighted expert set."""
+        candidates = self.lengths >= int(seq_length) + 1
+        candidate_idxs = candidates.nonzero(as_tuple=False).flatten()
+        if candidate_idxs.numel() == 0:
+            raise RuntimeError(f"Expert data has no trajectory long enough for {seq_length} frames")
+        probabilities = self.priorities[candidate_idxs]
+        probabilities = probabilities / probabilities.sum()
+        chosen = candidate_idxs[torch.multinomial(probabilities, int(batch_size), replacement=True)]
+        windows = []
+        for traj_idx in chosen.tolist():
+            length = int(self.lengths[traj_idx].item())
+            max_start = length - int(seq_length) - 1
+            start = int(torch.randint(0, max_start + 1, (1,), device=self.priorities.device).item())
+            windows.append(
+                self.observation_sequence(
+                    self.motion_ids[traj_idx],
+                    start,
+                    int(seq_length),
+                    next_offset=1,
+                )
+            )
+        return tree_map(lambda *values: torch.stack(values, dim=0), *windows)
 
     @property
     def capacity(self):
@@ -222,6 +362,42 @@ class TrajectoryDictBufferMultiDim(DictBuffer):
         for k in self.output_key_tp1:
             output["next"][k] = tree_map(lambda x: x[idxs], self.storage[k])
         return output
+
+    def sample_valid(self, batch_size: int, *, valid_key: str = "pace_valid"):
+        """Rejection-sample a fixed-size batch containing only valid PACE transitions."""
+        if self.storage is None or valid_key not in self.storage:
+            raise RuntimeError(f"Replay buffer does not contain required validity key {valid_key!r}")
+        chunks = []
+        collected = 0
+        for _ in range(20):
+            candidate = self.sample(max(int(batch_size) * 2, int(batch_size)))
+            valid = candidate[valid_key]
+            mask = valid.reshape(valid.shape[0], -1).all(dim=-1).bool()
+            if bool(mask.any()):
+                selected = tree_map(lambda value: value[mask], candidate)
+                chunks.append(selected)
+                collected += int(mask.sum().item())
+            if collected >= int(batch_size):
+                output = tree_map(lambda *values: torch.cat(values, dim=0), *chunks)
+                return tree_map(lambda value: value[: int(batch_size)], output)
+        if collected > 0:
+            # A fixed consolidation role normally keeps the valid fraction near
+            # 20%. If it ever falls much lower, reuse the valid candidates
+            # instead of letting one rank fail while peers enter gradient
+            # collectives and hang until the NCCL timeout.
+            warnings.warn(
+                f"PACE valid replay sampling collected only {collected}/{batch_size} unique candidates; "
+                "filling the batch with replacement",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            output = tree_map(lambda *values: torch.cat(values, dim=0), *chunks)
+            indices = torch.randint(0, collected, (int(batch_size),), device=output[valid_key].device)
+            return tree_map(lambda value: value[indices.to(value.device)], output)
+        raise RuntimeError(
+            "PACE replay contains no valid transitions after 20 sampling attempts. "
+            "This violates the fixed consolidation-role invariant and training cannot continue safely."
+        )
 
     def get_full_buffer(self) -> Dict:
         """We assume to return transition based"""

@@ -34,6 +34,10 @@ def build_fb_agent(
     lr_scale: float = 1.0,
     clip_grad_norm: float = 0.0,
     cartwheel_aux_safe: bool = False,
+    enable_tracking_q: bool = False,
+    freeze_backward: bool = False,
+    tracking_actor_grad_ratio: float = 0.10,
+    disable_discriminator: bool = False,
 ) -> FBcprAuxAgentConfig:
     if cartwheel_aux_safe:
         aux_rewards = [
@@ -136,6 +140,26 @@ def build_fb_agent(
                         name="DictInputFilterConfig", key=["state", "privileged_state", "last_action", "history_actor"]
                     ),
                 ),
+                tracking_critic=ForwardArchiConfig(
+                    name="ForwardArchi",
+                    hidden_dim=2048,
+                    model="residual",
+                    hidden_layers=6,
+                    embedding_layers=2,
+                    num_parallel=2,
+                    ensemble_mode="batch",
+                    input_filter=DictInputFilterConfig(
+                        name="DictInputFilterConfig",
+                        key=[
+                            "state",
+                            "privileged_state",
+                            "last_action",
+                            "history_actor",
+                            "reference_state",
+                            "reference_privileged_state",
+                        ],
+                    ),
+                ),
             ),
             obs_normalizer=ObsNormalizerConfig(
                 name="ObsNormalizerConfig",
@@ -152,6 +176,7 @@ def build_fb_agent(
             actor_std=0.05,
             amp=False,
             norm_aux_reward=RewardNormalizerConfig(name="RewardNormalizer", translate=False, scale=True),
+            use_tracking_critic=bool(enable_tracking_q),
         ),
         train=FBcprAuxAgentTrainConfig(
             name="FBcprAuxAgentTrainConfig",
@@ -185,9 +210,21 @@ def build_fb_agent(
             relabel_ratio=0.8,
             grad_penalty_discriminator=10.0,
             weight_decay_discriminator=0.0,
+            disable_discriminator=bool(disable_discriminator),
             lr_aux_critic=0.0003 * lr_scale,
             reg_coeff_aux=0.02,
             aux_critic_pessimism_penalty=0.5,
+            lr_tracking_critic=0.0003 * lr_scale,
+            tracking_critic_pessimism_penalty=0.5,
+            tracking_actor_grad_ratio=float(tracking_actor_grad_ratio),
+            tracking_actor_warmup_updates=1000,
+            tracking_actor_ramp_updates=1000,
+            tracking_grad_monitor_every_updates=32,
+            tracking_grad_ema_beta=0.95,
+            tracking_grad_scale_min=1.0e-4,
+            tracking_grad_scale_max=1.0e4,
+            tracking_grad_scale_rate_limit=2.0,
+            freeze_backward=bool(freeze_backward),
         ),
         aux_rewards=aux_rewards,
         aux_rewards_scaling=aux_rewards_scaling,

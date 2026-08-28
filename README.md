@@ -235,7 +235,52 @@ Optional: run `humanoidverse.tools.data_inspect` first if you want to validate t
 
 See [Import Wizard](docs/import_wizard.md) for data schemas and import commands, and [Robot-Config Training](docs/robot_config_training.md) for required training fields, current constraints, and bring-up guidance.
 
-## Multi-source skill injection
+## Motion sampling
+
+For the recommended single-dataset workflow, pass one complete motion pkl with `--data-path`. After every tracking evaluation, trajectories with EMD below `2.0` form one source with 95% sampling mass, while trajectories with EMD at least `2.0` form the high-EMD source with 5%. The existing exponential EMD priority is applied within each source, clamped to `[0.5, 2.0]`. The per-rank training pool preserves those source quotas, reserves one slot for every non-empty source when capacity permits, and samples within each source without replacement before repeating trajectories. The clamp and high-source boundary can be changed with `--emd-group-low-threshold` and `--emd-group-high-threshold`. Data ratios, sampling ratios, counts, and mean EMD are logged under `eval/emd_sampling/{non_high,high}/` in both W&B and TensorBoard.
+
+### Extreme-RGMT tracking Q experiment
+
+`--tracking-q` adds an independent reference-conditioned tracking critic while leaving the actor observation interface unchanged. Start it from a trained FB checkpoint with `--init-checkpoint`; this loads model weights only, freezes B/target-B and observation normalization, and starts fresh optimizers, replay, and counters. Expert-z environments now mirror evaluation temporally: they initialize from the exact first expert state (including velocity), then run every transition to the end of the roughly 500-step motion. The other environments retain the normal random/mixed-z or PACE fixed-goal behavior.
+
+PACE runs also log a low-cost 32-environment fixed-goal probe under `goal_reach/*`. `arrival_step_mean` reports the first step at which the current latent either reaches cosine similarity 0.95 or enters a 10-step error plateau after at least 20% improvement; `arrival_step_capped_mean` counts unreached goals as step 100. Tracking-Q actor diagnostics under `tracking_q/*` report the weighted gradient norm, cosine with the tracking gradient, and destructive conflict projection for discriminator, auxiliary, FB, and consolidation loss terms.
+
+The critic uses the BeyondMimic tracking terms requested by Extreme-RGMT: torso orientation, yaw-aligned relative body position/orientation, and global body linear/angular velocity. Only aligned expert-z transitions train this critic and receive its actor gradient. The tracking actor branch has a 1000-update critic warmup, a 1000-update linear ramp, and an EMA gradient calibration targeting 10% of the base actor-gradient norm. Rewards, Q diagnostics, uncertainty, calibration scale, gradient ratio, and ramp are logged under `train/tracking_reward/` and `train/tracking_q/` in W&B and TensorBoard.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --agent fb \
+  --tracking-q \
+  --init-checkpoint runs/bfm_zero_seed/20260804_040010 \
+  --work-dir runs/bfm_zero_seed \
+  --data-path humanoidverse/data/seed_train_full10s_5k.pkl \
+  --num-envs 512 \
+  --buffer-size 2560000 \
+  --cartwheel-aux-safe \
+  --use-wandb
+```
+
+### PACE Stage-II training
+
+Pass `--pace-base-checkpoint` to start a fresh Stage-II run from the model weights of a completed Stage-I run. PACE freezes B, target B, and the observation normalizer; preserves an immutable copy of the Stage-I actor; and uses fixed 80% acquisition / 20% consolidation environment roles. The initial full tracking eval partitions the dataset once using the base policy: its highest-EMD 10% is the immutable challenging set and supplies 80% of the training pool, while the immutable mastered set supplies 20%. Later evals update EMD priorities inside those fixed sets but never redefine their membership. Rank-relative exponential priorities are used inside the challenging set to avoid absolute-EMD clamp saturation. Acquisition environments use aligned rolling expert latents, while consolidation environments hold a mastered-motion target latent for 100 steps and train the adaptive policy-consistency loss.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --agent fb \
+  --work-dir runs/bfm_zero_seed \
+  --data-path humanoidverse/data/seed_train_full10s_5k.pkl \
+  --num-envs 512 \
+  --buffer-size 2560000 \
+  --cartwheel-aux-safe \
+  --pace-base-checkpoint runs/bfm_zero_seed/20260804_040010 \
+  --use-wandb
+```
+
+PACE first holds the actor fixed for 10 rollout windows, then ramps a Stage-II actor learning rate that is 0.1x the Stage-I value and applies one actor update per four critic updates. The consistency coefficient is gradient-calibrated: `lambda_con` retains the paper's progress-adaptive meaning while an EMA scale matches the raw consistency-gradient magnitude to the unnormalized FB-CPR acquisition gradient. Sampling and retention statistics are recorded under `eval/pace_sampling/` and `eval/pace_retention/`; adaptive coefficients, raw/weighted gradient ratios, gradient cosine, action RMSE, actor LR, and role-validity ratios are recorded under `train/pace/` in both W&B and TensorBoard. Mastered-set EMD triggers an LR warning above 1.10x baseline, recovery-only actor updates after two evals above 1.15x, and a safe stop above 1.25x. Every full eval saves an actor-only snapshot under `pace_eval_checkpoints/`; the regular checkpoint still stores the complete model, optimizers, PACE calibration/split state, and immutable actor. Resume refuses to proceed if `checkpoint/pace_reference_actor.safetensors` is missing. Tracking eval and checkpoint resume both perform a full environment reset, so any incomplete 24-step validity window is deliberately discarded instead of being joined to unrelated simulator state.
+
+### Legacy multi-source skill injection
 
 UFO supports manifest-based, source-weighted multi-source data mixing. This is useful for injecting rare agile skills, such as cartwheel motions, while preserving the base motion distribution. The dataset identity is sampled from a fixed source ratio, and prioritized sampling is applied within each source. See `configs/data/example_mix.yaml` for a compact manifest example.
 

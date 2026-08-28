@@ -290,8 +290,11 @@ class HumanoidVerseMjlabTrackingEvaluationConfig(BaseEvalConfig):
     # Used if above env is provided
     num_envs: int = 1024
 
+    # EMD prioritization requires exactly one result for each global motion ID.
     n_episodes_per_motion: int = 1
-    include_results_from_all_envs: bool = False  # If True, include results from all num_envs envs, not just first num_motions
+    # Must remain False for EMD prioritization; otherwise padded environments
+    # duplicate motion IDs in the evaluation result.
+    include_results_from_all_envs: bool = False
 
     disable_tqdm: bool = True
 
@@ -311,8 +314,11 @@ class HumanoidVerseMjlabTrackingEvaluation:
         else:
             if self.cfg.env is not None:
                 raise ValueError("Both env and cfg.env are provided, please provide only one (which one you want to evaluate with?)")
-        # NOTE: this is not used as it disables some domain randomization we want to keep for evaluation
-        # env._env.set_is_evaluating()
+        # Do not use set_is_evaluating(): tracking eval intentionally preserves
+        # its existing noise/domain-randomization semantics. Suspend only the
+        # PACE-specific grouped reset, failure, and segment-timeout behavior.
+        if hasattr(env._env, "suspend_pace_rollout_for_evaluation"):
+            env._env.suspend_pace_rollout_for_evaluation()
 
         self.motion_ids = list(range(env._env._motion_lib._num_unique_motions))
         n_envs = env._env.num_envs
@@ -323,9 +329,12 @@ class HumanoidVerseMjlabTrackingEvaluation:
             run_metrics = {}
             # If we have less envs than motions, we run iteratively over the motions
             for motion_id_chunk_start in range(0, len(self.motion_ids), n_envs):
-                motion_id_chunk = self.motion_ids[motion_id_chunk_start : motion_id_chunk_start + n_envs]
+                global_motion_ids = self.motion_ids[motion_id_chunk_start : motion_id_chunk_start + n_envs]
+                env._env._motion_lib.all_motions_loaded = False
+                env._env._motion_lib.load_motions(random_sample=False, motion_ids=global_motion_ids)
+                local_motion_ids = list(range(len(global_motion_ids)))
                 motion_chunk_results = _async_tracking_worker(
-                    (motion_id_chunk, 0, agent_or_model),
+                    (local_motion_ids, global_motion_ids, agent_or_model),
                     env=env,
                     disable_tqdm=self.cfg.disable_tqdm,
                     include_results_from_all_envs=self.cfg.include_results_from_all_envs,
@@ -358,11 +367,6 @@ class HumanoidVerseMjlabTrackingEvaluation:
                 v["timestep"] = timestep
                 logger.log(v)
 
-        # Resume back to original state of the motion lib if we were using shared env
-        if self.cfg.env is None:
-            env._env._motion_lib.load_motions_for_training()
-        env._env.set_is_training()
-
         return metrics, wandb_dict
 
     def close(self) -> None:
@@ -393,21 +397,32 @@ def group_assign_motions_to_envs_with_map(motion_ids, num_envs, device=None):
 def _async_tracking_worker(
     inputs, env: Any, disable_tqdm: bool = False, include_results_from_all_envs=False
 ):
-    motion_ids, pos, agent = inputs
+    motion_ids, global_motion_ids, agent = inputs
     model = extract_model(agent)
     # import ipdb; ipdb.set_trace()
     # motion_ids = torch.tensor(motion_ids, device=env.device)
     core_env = env._env
 
-    if not core_env._motion_lib.all_motions_loaded:
-        core_env._motion_lib.all_motions_loaded = True
-        core_env._motion_lib.load_motions(random_sample=False, num_motions_to_load=core_env._motion_lib._num_unique_motions, start_idx=0)
+    if len(motion_ids) != len(global_motion_ids):
+        raise ValueError("Local and global tracking motion id lists must have the same length")
+    global_id_by_local_id = dict(zip(motion_ids, global_motion_ids))
 
     metrics = {}
     num_envs = core_env.num_envs
 
     # Assign motions to envs in grouped fashion
-    assigned_motions, motion_to_envs = group_assign_motions_to_envs_with_map(motion_ids, num_envs)
+    assigned_motions, motion_to_envs = group_assign_motions_to_envs_with_map(
+        motion_ids, num_envs, device=core_env.device
+    )
+
+    # Keep the environment's reference-motion bookkeeping aligned with the
+    # local IDs in the currently loaded chunk.  This matters for the final
+    # chunk when it contains fewer motions than environments: leaving IDs
+    # from the previous 512-motion chunk makes reward/observation code index
+    # beyond the newly loaded motion tensors.
+    core_env.motion_ids.copy_(assigned_motions)
+    core_env.motion_len.copy_(core_env._motion_lib.get_motion_length(assigned_motions))
+    core_env.motion_start_times.zero_()
 
     ctx_dict = {}
     tracking_targets = {}
@@ -522,7 +537,7 @@ def _async_tracking_worker(
                         # "xpos": episode_data["xpos"][0 : ctx_dict[m_id].shape[0], env_id],
                         # "target_xpos": target_xpos_dict[env_id],
                         "tracking_target": tracking_targets[m_id],
-                        "motion_id": m_id,
+                        "motion_id": global_id_by_local_id[m_id],
                         "motion_file": core_env._motion_lib.curr_motion_keys[m_id],
                         "observation": tree_map(lambda x: x[0 : ctx_dict[m_id].shape[0] + 1, env_id], episode_data["observation"]),
                         "joint_pos": _joint_pos,
