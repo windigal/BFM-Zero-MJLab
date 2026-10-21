@@ -26,6 +26,7 @@ def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
         "TRITON_CACHE_DIR": "triton",
         "CUDA_CACHE_PATH": "cuda",
         "WARP_CACHE_PATH": "warp",
+        "MPLCONFIGDIR": "matplotlib",
     }.items():
         path = root / subdir
         path.mkdir(parents=True, exist_ok=True)

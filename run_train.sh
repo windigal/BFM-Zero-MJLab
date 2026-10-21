@@ -38,7 +38,8 @@ mkdir -p \
   "$UFO_CACHE_DIR/torchinductor" \
   "$UFO_CACHE_DIR/triton" \
   "$UFO_CACHE_DIR/cuda" \
-  "$UFO_CACHE_DIR/warp"
+  "$UFO_CACHE_DIR/warp" \
+  "$UFO_CACHE_DIR/matplotlib"
 
 export BFMZERO_MJLAB_CACHE_DIR="${BFMZERO_MJLAB_CACHE_DIR:-$UFO_CACHE_DIR}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$UFO_CACHE_DIR/uv}"
@@ -50,6 +51,7 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$UFO_CACHE_DIR/torchi
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$UFO_CACHE_DIR/triton}"
 export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$UFO_CACHE_DIR/cuda}"
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UFO_CACHE_DIR/warp}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$UFO_CACHE_DIR/matplotlib}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 
-exec uv run python -m humanoidverse.train "$@"
+exec uv run python -m "${UFO_TRAIN_MODULE:-humanoidverse.train}" "$@"

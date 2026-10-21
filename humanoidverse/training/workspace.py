@@ -629,10 +629,7 @@ class Workspace:
                 global_time=self._checkpoint_global_time,
                 optimizer_steps=self._optimizer_steps,
             )
-        # see https://farama.org/Vector-Autoreset-Mode
         terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-        truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-        done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         total_metrics, context = None, None
         metric_update_counts: dict[str, int] = {}
         start_time = time.time()
@@ -670,7 +667,9 @@ class Workspace:
                     barrier()
                 eval_time_checker.update_last_step(global_time)
                 if uses_humanoidverse_eval:
-                    # reset if there is a humanoidverse evaluation
+                    # Evaluation leaves its last motion chunk loaded. Reload one training
+                    # pool, then reset; this is the sole post-eval reset.
+                    train_env._env.prepare_training_motion_pool()
                     td, info = train_env.reset()
                     if self.cfg.fail_on_nonfinite:
                         _assert_finite(
@@ -682,8 +681,6 @@ class Workspace:
                             optimizer_steps=self._optimizer_steps,
                         )
                     terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-                    truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-                    done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
 
                 if self.cfg.prioritization:
                     # priorities
@@ -848,7 +845,8 @@ class Workspace:
                     # make sure we set truncated since at the next iteration we are forced to reset the environment
                     # after the evaluation. This is because we share the environment with the evaluation
                     new_truncated = np.ones_like(new_truncated, dtype=bool)
-                    truncated = np.ones_like(new_truncated, dtype=bool)
+
+            new_done = np.logical_or(new_terminated, new_truncated).reshape(-1)
 
             if Version(gymnasium.__version__) >= Version("1.0"):
                 if self.cfg.use_trajectory_buffer:
@@ -856,7 +854,8 @@ class Workspace:
                         "observation": tree_map(lambda x: x[None, ...], obs),
                         "action": action[None, ...],
                         "terminated": terminated[None, ..., None],
-                        "truncated": truncated[None, ..., None],
+                        # End this trajectory before the same-step reset observation.
+                        "truncated": new_done[None, ..., None],
                         "step_count": step_count[None, ..., None],
                         "reward": new_reward[None, ..., None],
                     }
@@ -872,9 +871,8 @@ class Workspace:
                     if "aux_rewards" in new_info:
                         data["aux_rewards"] = {k: v[None, ..., None] for k, v in new_info["aux_rewards"].items() if not k.startswith("_")}
                 else:
-                    # We add only transitions corresponding to environments that have not reset in the previous step.
-                    # For environments that have reset in the previous step, the new observation corresponds to the state after reset.
-                    indexes = ~done
+                    # Reset steps return initial observations, so omit their transitions.
+                    indexes = ~new_done
 
                     real_next_obs = tree_map(lambda x: x.astype(np.float32 if x.dtype == np.float64 else x.dtype)[indexes], new_td)
                     # TODO again, we need to remove "time" from the observation (to stay consistent with obs_space)
@@ -995,8 +993,6 @@ class Workspace:
             progb.update(global_step_increment)
             td = new_td
             terminated = new_terminated
-            truncated = new_truncated
-            done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
             info = new_info
         train_env.close()
 

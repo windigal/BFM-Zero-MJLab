@@ -13,6 +13,7 @@ import copy
 import numpy as np
 import ot
 import torch
+from pydantic import Field
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
@@ -290,10 +291,18 @@ class HumanoidVerseMjlabTrackingEvaluationConfig(BaseEvalConfig):
     # Used if above env is provided
     num_envs: int = 1024
 
+    # EMD prioritization requires exactly one result for each global motion ID.
     n_episodes_per_motion: int = 1
-    include_results_from_all_envs: bool = False  # If True, include results from all num_envs envs, not just first num_motions
+    # Must remain False for EMD prioritization; otherwise padded environments
+    # duplicate motion IDs in the evaluation result.
+    include_results_from_all_envs: bool = False
 
     disable_tqdm: bool = True
+    seq_length: int = 1
+    max_motions: int | None = None
+    motion_batch_size: int | None = Field(default=None, ge=1)
+    selection_seed: int = 0
+    body_metrics: bool = False
 
     def build(self):
         return HumanoidVerseMjlabTrackingEvaluation(self)
@@ -311,24 +320,40 @@ class HumanoidVerseMjlabTrackingEvaluation:
         else:
             if self.cfg.env is not None:
                 raise ValueError("Both env and cfg.env are provided, please provide only one (which one you want to evaluate with?)")
-        # NOTE: this is not used as it disables some domain randomization we want to keep for evaluation
-        # env._env.set_is_evaluating()
+        # Do not use set_is_evaluating(): tracking eval intentionally preserves
+        # its existing noise/domain-randomization semantics. Suspend only the
+        # aligned-rollout reset and segment-timeout behavior.
+        if hasattr(env._env, "suspend_tracking_rollout_for_evaluation"):
+            env._env.suspend_tracking_rollout_for_evaluation()
 
         self.motion_ids = list(range(env._env._motion_lib._num_unique_motions))
-        n_envs = env._env.num_envs
+        if self.cfg.max_motions is not None:
+            if self.cfg.max_motions < 1:
+                raise ValueError("max_motions must be positive")
+            self.motion_ids = sorted(
+                np.random.default_rng(self.cfg.selection_seed)
+                .choice(self.motion_ids, size=min(self.cfg.max_motions, len(self.motion_ids)), replace=False)
+                .tolist()
+            )
+        batch_size = min(env._env.num_envs, self.cfg.motion_batch_size or env._env.num_envs)
 
         # "Parallelization" is handled on the worker level.
         metrics = {}
         for repetition_i in range(self.cfg.n_episodes_per_motion):
             run_metrics = {}
             # If we have less envs than motions, we run iteratively over the motions
-            for motion_id_chunk_start in range(0, len(self.motion_ids), n_envs):
-                motion_id_chunk = self.motion_ids[motion_id_chunk_start : motion_id_chunk_start + n_envs]
+            for motion_id_chunk_start in range(0, len(self.motion_ids), batch_size):
+                global_motion_ids = self.motion_ids[motion_id_chunk_start : motion_id_chunk_start + batch_size]
+                env._env._motion_lib.all_motions_loaded = False
+                env._env._motion_lib.load_motions(random_sample=False, motion_ids=global_motion_ids)
+                local_motion_ids = list(range(len(global_motion_ids)))
                 motion_chunk_results = _async_tracking_worker(
-                    (motion_id_chunk, 0, agent_or_model),
+                    (local_motion_ids, global_motion_ids, agent_or_model),
                     env=env,
                     disable_tqdm=self.cfg.disable_tqdm,
                     include_results_from_all_envs=self.cfg.include_results_from_all_envs,
+                    seq_length=self.cfg.seq_length,
+                    body_metrics=self.cfg.body_metrics,
                 )
                 for k, v in motion_chunk_results.items():
                     assert k not in run_metrics, "Tried to override existing metric"
@@ -358,11 +383,6 @@ class HumanoidVerseMjlabTrackingEvaluation:
                 v["timestep"] = timestep
                 logger.log(v)
 
-        # Resume back to original state of the motion lib if we were using shared env
-        if self.cfg.env is None:
-            env._env._motion_lib.load_motions_for_training()
-        env._env.set_is_training()
-
         return metrics, wandb_dict
 
     def close(self) -> None:
@@ -391,28 +411,40 @@ def group_assign_motions_to_envs_with_map(motion_ids, num_envs, device=None):
 
 
 def _async_tracking_worker(
-    inputs, env: Any, disable_tqdm: bool = False, include_results_from_all_envs=False
+    inputs, env: Any, disable_tqdm: bool = False, include_results_from_all_envs=False, seq_length=1, body_metrics=False
 ):
-    motion_ids, pos, agent = inputs
+    motion_ids, global_motion_ids, agent = inputs
     model = extract_model(agent)
     # import ipdb; ipdb.set_trace()
     # motion_ids = torch.tensor(motion_ids, device=env.device)
     core_env = env._env
 
-    if not core_env._motion_lib.all_motions_loaded:
-        core_env._motion_lib.all_motions_loaded = True
-        core_env._motion_lib.load_motions(random_sample=False, num_motions_to_load=core_env._motion_lib._num_unique_motions, start_idx=0)
+    if len(motion_ids) != len(global_motion_ids):
+        raise ValueError("Local and global tracking motion id lists must have the same length")
+    global_id_by_local_id = dict(zip(motion_ids, global_motion_ids))
 
     metrics = {}
     num_envs = core_env.num_envs
 
     # Assign motions to envs in grouped fashion
-    assigned_motions, motion_to_envs = group_assign_motions_to_envs_with_map(motion_ids, num_envs)
+    assigned_motions, motion_to_envs = group_assign_motions_to_envs_with_map(
+        motion_ids, num_envs, device=core_env.device
+    )
+
+    # Keep the environment's reference-motion bookkeeping aligned with the
+    # local IDs in the currently loaded chunk.  This matters for the final
+    # chunk when it contains fewer motions than environments: leaving IDs
+    # from the previous 512-motion chunk makes reward/observation code index
+    # beyond the newly loaded motion tensors.
+    core_env.motion_ids.copy_(assigned_motions)
+    core_env.motion_len.copy_(core_env._motion_lib.get_motion_length(assigned_motions))
+    core_env.motion_start_times.zero_()
 
     ctx_dict = {}
     tracking_targets = {}
     # target_xpos_dict = {}
     tracking_joint_pos = {}
+    tracking_body_pos = {}
     dof_states_list = [None] * num_envs
     root_states_list = [None] * num_envs
 
@@ -422,12 +454,14 @@ def _async_tracking_worker(
         # first z should try to reach the next state, ie 1:
         z = model.backward_map(tree_map(lambda x: x[1:], tracking_target)).clone()
         for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
+            end_idx = min(step + seq_length, z.shape[0])
             z[step] = z[step:end_idx].mean(dim=0)
         ctx = model.project_z(z)
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tree_map(lambda x: x.cpu(), tracking_target)
         tracking_joint_pos[m_id] = tracking_target_dict["dof_pos"].clone()
+        if body_metrics:
+            tracking_body_pos[m_id] = tracking_target_dict["ref_body_pos"][:, :core_env.num_bodies].clone()
         # import ipdb; ipdb.set_trace()
 
         ref_body_rots = tracking_target_dict["ref_body_rots"][0, 0]
@@ -507,7 +541,8 @@ def _async_tracking_worker(
             )
 
         episode_data = _episode.get()
-        episode_data["xpos"] = torch.stack(xpos_log)[:-1]
+        body_positions = torch.stack(xpos_log)
+        episode_data["xpos"] = body_positions[:-1]
         joint_pos = torch.stack(joint_pos)
         joint_vel = torch.stack(joint_vel)
 
@@ -522,7 +557,7 @@ def _async_tracking_worker(
                         # "xpos": episode_data["xpos"][0 : ctx_dict[m_id].shape[0], env_id],
                         # "target_xpos": target_xpos_dict[env_id],
                         "tracking_target": tracking_targets[m_id],
-                        "motion_id": m_id,
+                        "motion_id": global_id_by_local_id[m_id],
                         "motion_file": core_env._motion_lib.curr_motion_keys[m_id],
                         "observation": tree_map(lambda x: x[0 : ctx_dict[m_id].shape[0] + 1, env_id], episode_data["observation"]),
                         "joint_pos": _joint_pos,
@@ -533,6 +568,10 @@ def _async_tracking_worker(
                 # Rename the metrics so that repetitions do not overlap
                 assert len(local_metrics) == 1
                 metric_key = list(local_metrics.keys())[0]
+                if body_metrics:
+                    local_metrics[metric_key].update(compute_body_tracking_metrics(
+                        body_positions[:ctx_dict[m_id].shape[0] + 1, env_id], tracking_body_pos[m_id],
+                    ))
 
                 if include_results_from_all_envs:
                     metrics[f"{metric_key}_repetition#{motion_repetition}"] = local_metrics[metric_key]
@@ -654,6 +693,19 @@ def _calc_metrics(ep):
     metr["motion_id"] = ep["motion_id"]
     metr["motion_file"] = ep["motion_file"]
     return {ep["motion_file"]: metr}
+
+
+def compute_body_tracking_metrics(position, target):
+    """Actual rigid-body MPJPE in mm; the legacy mpjpe_l uses joint angles."""
+    global_error = torch.linalg.vector_norm(position - target, dim=-1)
+    local_position = position - position[:, :1]
+    local_target = target - target[:, :1]
+    local_error = torch.linalg.vector_norm(local_position - local_target, dim=-1)
+    return {
+        "mpjpe_body_global_mm": global_error.mean().item() * 1000,
+        "mpjpe_body_local_mm": local_error.mean().item() * 1000,
+        "success_body_0.5m": float(torch.all(local_error <= 0.5)),
+    }
 
 
 def compute_joint_pos_metrics(joint_pos, target_joint_pos):

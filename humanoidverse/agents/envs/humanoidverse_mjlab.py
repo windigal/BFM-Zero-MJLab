@@ -30,9 +30,11 @@ from humanoidverse.envs.motion_observations import compute_humanoid_observations
 from humanoidverse.utils.helpers import pre_process_config
 from humanoidverse.utils.motion_lib.motion_lib_robot import MotionLibRobot
 from humanoidverse.utils.torch_utils import (
+    calc_heading_quat,
     calc_heading_quat_inv,
     my_quat_rotate,
     quat_from_angle_axis,
+    quat_inverse,
     quat_mul,
     quat_rotate_inverse,
     wxyz_to_xyzw,
@@ -49,6 +51,23 @@ HYDRA_CONFIG_DIR = os.path.join(HUMANOIDVERSE_DIR, "config")
 HYDRA_CONFIG_REL_PATH = os.path.join("exp", "bfm_zero", "bfm_zero")
 G1_MJLAB_MJCF_PATH = "humanoidverse/data/robots/g1_mjlab/g1_29dof.xml"
 G1_MJLAB_ACTUATOR_SOURCE = "g1-mode_15"
+
+TRACKING_BODIES = (
+    "pelvis",
+    "left_hip_roll_link",
+    "left_knee_link",
+    "left_ankle_roll_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "right_ankle_roll_link",
+    "torso_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+)
 
 
 def _resolve_humanoidverse_path(path_value: str | os.PathLike[str]) -> str:
@@ -688,6 +707,20 @@ class HumanoidVerseMjlabCore:
         self.time_out_buf = torch.zeros_like(self.reset_buf)
         self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.extras: dict[str, Any] = {"aux_rewards": {}}
+        self.ppo_reward_model = None
+        self.ppo_reward_observation_noise = False
+        self.ppo_latent = None
+        # Aligned expert-tracking rollouts (PPO-FB). Disabled until configure_tracking_rollouts().
+        self.tracking_rollout_enabled = False
+        # Tracking eval keeps normal noise/domain-rand semantics, so it cannot use is_evaluating.
+        self.tracking_rollout_suspended = False
+        self.tracking_expert_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.tracking_motion_start_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.tracking_segment_lengths = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.tracking_expert_motion_lengths: torch.Tensor | None = None
+        self.tracking_seq_length = 8
+        self.tracking_body_indices: torch.Tensor | None = None
+        self.tracking_anchor_index: int | None = None
 
         self._init_reward_scales()
         self._validate_aux_reward_semantics(hv_config)
@@ -824,10 +857,74 @@ class HumanoidVerseMjlabCore:
             return
         self.motion_ids[env_ids] = self._motion_lib.sample_motions(len(env_ids))
         self.motion_len[env_ids] = self._motion_lib.get_motion_length(self.motion_ids[env_ids])
+        use_tracking_alignment = (
+            self.tracking_rollout_enabled and not self.tracking_rollout_suspended and not self.is_evaluating
+        )
         if self.is_evaluating and not self.config.enforce_randomize_motion_start_eval:
             self.motion_start_times[env_ids] = 0.0
+        elif use_tracking_alignment:
+            if self.tracking_expert_motion_lengths is None:
+                raise RuntimeError("Tracking expert-buffer motion lengths have not been configured")
+            expert = self.tracking_expert_mask[env_ids]
+            global_motion_ids = self._motion_lib.global_motion_ids(self.motion_ids[env_ids])
+            aligned_lengths = self.tracking_expert_motion_lengths[global_motion_ids] - 1
+            # Exact evaluation-style start: expert frame 0, run to the final transition.
+            self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
+            self.motion_start_times[env_ids[expert]] = 0.0
+            self.tracking_motion_start_steps[env_ids] = 0
+            self.tracking_segment_lengths[env_ids] = 0
+            self.tracking_segment_lengths[env_ids[expert]] = aligned_lengths[expert]
         else:
             self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
+
+    def configure_tracking_rollouts(
+        self,
+        expert_mask: torch.Tensor | np.ndarray,
+        *,
+        expert_motion_lengths: torch.Tensor | np.ndarray,
+        seq_length: int,
+    ) -> None:
+        """Mark a fixed subset of envs as aligned expert-tracking rollouts."""
+        mask = torch.as_tensor(expert_mask, device=self.device, dtype=torch.bool)
+        if mask.shape != (self.num_envs,):
+            raise ValueError(f"Expected one tracking role per environment, got {tuple(mask.shape)}")
+        lengths = torch.as_tensor(expert_motion_lengths, device=self.device, dtype=torch.long)
+        if lengths.shape != (self._motion_lib._num_unique_motions,):
+            raise ValueError(
+                "Tracking requires one expert-buffer length per global motion: "
+                f"expected {self._motion_lib._num_unique_motions}, got {tuple(lengths.shape)}"
+            )
+        if torch.any(lengths < int(seq_length) + 1):
+            bad = (lengths < int(seq_length) + 1).nonzero(as_tuple=False).flatten()[:10].tolist()
+            raise ValueError(f"Expert motions are too short for z windows: motion_ids={bad}")
+        missing_bodies = [name for name in TRACKING_BODIES if name not in self.body_names]
+        if missing_bodies:
+            raise ValueError(f"Robot is missing tracking bodies: {missing_bodies}")
+        self.tracking_body_indices = torch.tensor(
+            [self.body_names.index(name) for name in TRACKING_BODIES], device=self.device, dtype=torch.long
+        )
+        self.tracking_anchor_index = self.body_names.index("torso_link")
+        self.tracking_rollout_enabled = True
+        self.tracking_rollout_suspended = False
+        self.tracking_expert_mask = mask
+        self.tracking_expert_motion_lengths = lengths
+        self.tracking_seq_length = int(seq_length)
+        self.tracking_segment_lengths.fill_(torch.iinfo(torch.long).max)
+
+    def get_tracking_rollout_metadata(self) -> dict[str, torch.Tensor]:
+        if not self.tracking_rollout_enabled:
+            raise RuntimeError("Tracking rollouts have not been configured")
+        return {
+            "expert_rollout": self.tracking_expert_mask.clone(),
+            "global_motion_ids": self._motion_lib.global_motion_ids(self.motion_ids).clone(),
+            "motion_start_steps": self.tracking_motion_start_steps.clone(),
+            "segment_lengths": self.tracking_segment_lengths.clone(),
+            "max_segment_length": self.tracking_expert_motion_lengths.max() - 1,
+        }
+
+    def suspend_tracking_rollout_for_evaluation(self) -> None:
+        """Disable only aligned-rollout behavior during tracking evaluation."""
+        self.tracking_rollout_suspended = True
 
     def _randomize_default_dof_pos_offset(self, env_ids: torch.Tensor) -> None:
         if bool(self.config.domain_rand.get("randomize_default_dof_pos", False)):
@@ -1015,10 +1112,118 @@ class HumanoidVerseMjlabCore:
             reward += rew
         return reward, aux
 
+    @staticmethod
+    def _quat_error_magnitude(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        # q and -q encode the same rotation. The absolute dot product gives the
+        # shortest rotation angle without constructing a numerically noisy error quaternion.
+        dot = torch.abs(torch.sum(first * second, dim=-1)).clamp(max=1.0)
+        return 2.0 * torch.acos(dot)
+
+    def _compute_tracking_rewards(self) -> dict[str, torch.Tensor]:
+        zeros = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        enabled = self.tracking_rollout_enabled and not self.tracking_rollout_suspended and not self.is_evaluating
+        mask = self.tracking_expert_mask if enabled else torch.zeros_like(self.tracking_expert_mask)
+        rewards = {
+            "anchor_orientation": zeros.clone(),
+            "relative_body_position": zeros.clone(),
+            "relative_body_orientation": zeros.clone(),
+            "global_body_linear_velocity": zeros.clone(),
+            "global_body_angular_velocity": zeros.clone(),
+            "total": zeros.clone(),
+        }
+        if not bool(mask.any()):
+            return rewards
+
+        ids = mask.nonzero(as_tuple=False).flatten()
+        if self.tracking_body_indices is None:
+            raise RuntimeError("Tracking body indices have not been configured")
+        body_ids = self.tracking_body_indices
+        # The cached reference belongs to the action target at t+1. Refresh
+        # only the current body tensors here so both sides describe the state
+        # reached by the action that just finished.
+        body_pos, body_rot, body_vel, body_ang_vel = self._extend_body_state()
+        current_pos = body_pos[ids][:, body_ids]
+        current_rot = body_rot[ids][:, body_ids]
+        current_vel = body_vel[ids][:, body_ids]
+        current_ang_vel = body_ang_vel[ids][:, body_ids]
+        reference_pos = self.ref_body_pos_extend[ids][:, body_ids]
+        reference_rot = self.ref_body_rot_extend[ids][:, body_ids]
+        reference_vel = self.ref_body_vel_extend[ids][:, body_ids]
+        reference_ang_vel = self.ref_body_ang_vel_extend[ids][:, body_ids]
+
+        anchor_body_offset = TRACKING_BODIES.index("torso_link")
+        current_anchor_pos = current_pos[:, anchor_body_offset]
+        current_anchor_rot = current_rot[:, anchor_body_offset]
+        reference_anchor_pos = reference_pos[:, anchor_body_offset]
+        reference_anchor_rot = reference_rot[:, anchor_body_offset]
+        delta_heading = quat_mul(
+            calc_heading_quat(current_anchor_rot, True),
+            quat_inverse(calc_heading_quat(reference_anchor_rot, True), True),
+            w_last=True,
+        )
+        repeated_heading = delta_heading[:, None, :].expand(-1, len(body_ids), -1)
+        aligned_reference_pos = my_quat_rotate(
+            repeated_heading.reshape(-1, 4),
+            (reference_pos - reference_anchor_pos[:, None, :]).reshape(-1, 3),
+        ).view_as(reference_pos)
+        aligned_anchor_pos = current_anchor_pos.clone()
+        aligned_anchor_pos[:, 2] = reference_anchor_pos[:, 2]
+        aligned_reference_pos = aligned_reference_pos + aligned_anchor_pos[:, None, :]
+        aligned_reference_rot = quat_mul(
+            repeated_heading.reshape(-1, 4),
+            reference_rot.reshape(-1, 4),
+            w_last=True,
+        ).view_as(reference_rot)
+
+        anchor_ori = torch.exp(
+            -self._quat_error_magnitude(reference_anchor_rot, current_anchor_rot).square() / (0.4**2)
+        )
+        relative_pos = torch.exp(
+            -torch.sum((aligned_reference_pos - current_pos).square(), dim=-1).mean(dim=-1) / (0.3**2)
+        )
+        relative_ori = torch.exp(
+            -self._quat_error_magnitude(aligned_reference_rot, current_rot).square().mean(dim=-1) / (0.4**2)
+        )
+        global_lin_vel = torch.exp(
+            -torch.sum((reference_vel - current_vel).square(), dim=-1).mean(dim=-1) / (1.0**2)
+        )
+        global_ang_vel = torch.exp(
+            -torch.sum((reference_ang_vel - current_ang_vel).square(), dim=-1).mean(dim=-1) / (3.14**2)
+        )
+        rewards["anchor_orientation"][ids] = anchor_ori
+        rewards["relative_body_position"][ids] = relative_pos
+        rewards["relative_body_orientation"][ids] = relative_ori
+        rewards["global_body_linear_velocity"][ids] = global_lin_vel
+        rewards["global_body_angular_velocity"][ids] = global_ang_vel
+        rewards["total"][ids] = (
+            0.5 * anchor_ori + relative_pos + relative_ori + global_lin_vel + global_ang_vel
+        ) / 4.5
+        return rewards
+
     def _normalized_action(self, actions: torch.Tensor) -> torch.Tensor:
         if bool(self.config.robot.control.normalize_action):
             actions = actions * float(self.config.robot.control.normalize_action_to) / float(self.config.robot.control.normalize_action_from)
         return torch.clamp(actions, -float(self.config.robot.control.action_clip_value), float(self.config.robot.control.action_clip_value))
+
+    def _reward_observation(self) -> dict[str, torch.Tensor]:
+        """Current physical state for B/D, without advancing observation history."""
+        self._compute_reference_and_privileged_obs()
+        fields = {
+            "dof_pos": self.dof_pos - (self.default_dof_pos + self.default_dof_pos_offset),
+            "dof_vel": self.dof_vel,
+            "projected_gravity": self.projected_gravity,
+            "base_ang_vel": self.base_ang_vel,
+            "max_local_self": self._max_local_self,
+        }
+        if self.ppo_reward_observation_noise:
+            fields = {key: self._apply_obs_scale_noise(key, value) for key, value in fields.items()}
+        else:
+            scales = self.config.obs.obs_scales
+            fields = {key: value * float(scales.get(key, 1.0)) for key, value in fields.items()}
+        return {
+            "state": torch.cat([fields[key] for key in ("dof_pos", "dof_vel", "projected_gravity", "base_ang_vel")], dim=-1),
+            "privileged_state": fields["max_local_self"],
+        }
 
     def _mjlab_action_input(self) -> torch.Tensor:
         action_indices = self._action_term_dof_indices
@@ -1035,11 +1240,23 @@ class HumanoidVerseMjlabCore:
         _, _, terminated, time_outs, _ = self.mjlab_env.step(mjlab_actions)
         self._refresh_state()
         reward, aux = self._compute_reward()
+        tracking_rewards = self._compute_tracking_rewards() if self.tracking_rollout_enabled else None
+        representation_rewards = None
+        if self.ppo_reward_model is not None and not self.is_evaluating:
+            representation_rewards = self.ppo_reward_model(self._reward_observation(), self.ppo_latent)
+        if self.tracking_rollout_enabled and not self.tracking_rollout_suspended and not self.is_evaluating:
+            aligned_ids = self.tracking_expert_mask.nonzero(as_tuple=False).flatten()
+            if aligned_ids.numel() > 0:
+                aligned_end = torch.zeros_like(time_outs, dtype=torch.bool)
+                aligned_end[aligned_ids] = self.episode_length_buf[aligned_ids] >= self.tracking_segment_lengths[aligned_ids]
+                time_outs = torch.logical_or(time_outs.bool(), aligned_end)
         reset = torch.logical_or(terminated.bool(), time_outs.bool())
         self.reset_buf = reset
         self.time_out_buf = time_outs.bool()
         self.rew_buf = reward
         self.extras["aux_rewards"] = {k: v.clone().detach() for k, v in aux.items()}
+        if tracking_rewards is not None:
+            self.extras["tracking_rewards"] = {k: v.clone().detach() for k, v in tracking_rewards.items()}
         if self.use_reward_penalty_curriculum:
             self.extras["penalty_scale"] = torch.tensor(self.reward_penalty_scale, dtype=torch.float32, device=self.device)
             self.extras["average_episode_length"] = torch.tensor(self.average_episode_length, dtype=torch.float32, device=self.device)
@@ -1056,7 +1273,12 @@ class HumanoidVerseMjlabCore:
             self.reset_idx(reset_ids)
         else:
             self.simulator.refresh()
-        return None, reward, reset, {"time_outs": time_outs.bool(), "aux_rewards": self.extras["aux_rewards"]}
+        info = {"time_outs": time_outs.bool(), "aux_rewards": self.extras["aux_rewards"]}
+        if tracking_rewards is not None:
+            info["tracking_rewards"] = self.extras["tracking_rewards"]
+        if representation_rewards is not None:
+            info["representation_rewards"] = representation_rewards
+        return None, reward, reset, info
 
     def reset_all(self, target_states: dict[str, torch.Tensor] | None = None):
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
@@ -1081,8 +1303,14 @@ class HumanoidVerseMjlabCore:
             root_rot = motion_res["root_rot"]
             root_vel = motion_res["root_vel"]
             root_ang_vel = motion_res["root_ang_vel"]
+            # Aligned expert envs start from the exact first expert state: no init noise, no lie-down.
+            exact_expert_init = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+            if self.tracking_rollout_enabled and not self.tracking_rollout_suspended and not self.is_evaluating:
+                exact_expert_init |= self.tracking_expert_mask[env_ids]
+            init_noise = (~exact_expert_init).to(root_pos.dtype).unsqueeze(-1)
             if self.config.get("lie_down_init", False):
                 mask = torch.rand(len(env_ids), device=self.device) < float(getattr(self.config, "lie_down_init_prob", 0.0))
+                mask &= ~exact_expert_init
                 if torch.any(mask):
                     root_pos = root_pos.clone()
                     root_rot = root_rot.clone()
@@ -1094,27 +1322,27 @@ class HumanoidVerseMjlabCore:
                         w_last=True,
                     )
                     root_rot[mask] = quat_mul(rot_quat.expand_as(root_rot[mask]), root_rot[mask], w_last=True)
-            root_pos = root_pos + torch.randn_like(root_pos) * float(self.config.init_noise_scale.root_pos) * float(self.config.noise_to_initial_level)
+            root_pos = root_pos + torch.randn_like(root_pos) * float(self.config.init_noise_scale.root_pos) * float(self.config.noise_to_initial_level) * init_noise
             root_rot = quat_mul(
                 _small_random_quaternions(
                     len(env_ids),
                     float(self.config.init_noise_scale.root_rot) * 3.14 / 180.0 * float(self.config.noise_to_initial_level),
                     self.device,
-                ),
+                ) * init_noise + torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device) * (1.0 - init_noise),
                 root_rot,
                 w_last=True,
             )
-            root_vel = root_vel + torch.randn_like(root_vel) * float(self.config.init_noise_scale.root_vel) * float(self.config.noise_to_initial_level)
+            root_vel = root_vel + torch.randn_like(root_vel) * float(self.config.init_noise_scale.root_vel) * float(self.config.noise_to_initial_level) * init_noise
             root_ang_vel = root_ang_vel + torch.randn_like(root_ang_vel) * float(self.config.init_noise_scale.root_ang_vel) * float(
                 self.config.noise_to_initial_level
-            )
+            ) * init_noise
             root_xyzw = torch.cat([root_pos, root_rot, root_vel, root_ang_vel], dim=-1)
             joint_pos = motion_res["dof_pos"] + torch.randn_like(motion_res["dof_pos"]) * float(self.config.init_noise_scale.dof_pos) * float(
                 self.config.noise_to_initial_level
-            )
+            ) * init_noise
             joint_vel = motion_res["dof_vel"] + torch.randn_like(motion_res["dof_vel"]) * float(self.config.init_noise_scale.dof_vel) * float(
                 self.config.noise_to_initial_level
-            )
+            ) * init_noise
 
         root_wxyz = torch.cat([root_xyzw[:, :3], xyzw_to_wxyz(root_xyzw[:, 3:7]), root_xyzw[:, 7:13]], dim=-1)
         self.robot.write_root_state_to_sim(root_wxyz, env_ids=env_ids)
@@ -1137,11 +1365,21 @@ class HumanoidVerseMjlabCore:
         self.reset_all()
 
     def set_is_training(self):
+        self.prepare_training_motion_pool()
+        self.reset_all()
+
+    def prepare_training_motion_pool(self, motion_ids=None):
+        """Load a fresh training pool without resetting the vector environment."""
         self.is_evaluating = False
-        self.resample_motion()
+        self.tracking_rollout_suspended = False
+        if motion_ids is None:
+            self._motion_lib.load_motions_for_training(max_num_seqs=self.num_envs)
+        else:
+            self._motion_lib.all_motions_loaded = False
+            self._motion_lib.load_motions(random_sample=False, motion_ids=motion_ids)
 
     def resample_motion(self):
-        self._motion_lib.load_motions_for_training(max_num_seqs=self.num_envs)
+        self.prepare_training_motion_pool()
         self.reset_all()
 
     def close(self):
@@ -1254,6 +1492,8 @@ class HumanoidVerseMjlabVectorEnv(VectorEnv):
             terminated = terminated.detach().cpu().numpy()
             truncated = truncated.detach().cpu().numpy()
             new_info["aux_rewards"] = {k: v.detach().cpu().numpy() for k, v in new_info["aux_rewards"].items()}
+            if "tracking_rewards" in new_info:
+                new_info["tracking_rewards"] = {k: v.detach().cpu().numpy() for k, v in new_info["tracking_rewards"].items()}
         return observation, reward, terminated, truncated, new_info
 
     def close(self):

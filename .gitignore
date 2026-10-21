@@ -23,6 +23,7 @@ tea_debug.log
 # Generated inference media
 model/
 
-# Downloaded public motion data
+# External motion data; restore separately (docs/ppo_fb_setup.md)
 humanoidverse/data/lafan_29dof_10s-clipped.pkl
 humanoidverse/data/lafan_29dof.pkl
+humanoidverse/data/seed_train_full10s_5k.pkl

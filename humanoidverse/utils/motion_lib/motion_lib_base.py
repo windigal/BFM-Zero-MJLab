@@ -193,6 +193,7 @@ class MotionLibBase():
         
         #### Termination history
         self._curr_motion_ids = None
+        self._global_emd_sampling = False
         self._termination_history = torch.zeros(self._num_unique_motions).to(self._device)
         self._success_rate = torch.zeros(self._num_unique_motions).to(self._device)
         self._sampling_history = torch.zeros(self._num_unique_motions).to(self._device)
@@ -244,7 +245,14 @@ class MotionLibBase():
     def _refresh_sampling_batch_prob(self):
         if self._curr_motion_ids is None:
             return
-        batch_prob = self._sampling_prob[self._curr_motion_ids]
+        # A partial global-EMD pool is already an importance sample from the target
+        # distribution. Re-weighting its slots would roughly square the probabilities,
+        # so reuse those slots uniformly. If every unique motion is resident, keep weights.
+        partial_global_emd_pool = self._global_emd_sampling and len(self._curr_motion_ids) < self._num_unique_motions
+        if partial_global_emd_pool:
+            batch_prob = torch.ones(len(self._curr_motion_ids), device=self._device, dtype=torch.float32)
+        else:
+            batch_prob = self._sampling_prob[self._curr_motion_ids]
         total = batch_prob.sum()
         if not torch.isfinite(total) or float(total) <= 0.0:
             batch_prob = torch.ones_like(batch_prob)
@@ -511,7 +519,8 @@ class MotionLibBase():
                      random_sample=True, 
                      start_idx=0, 
                      max_len=-1, 
-                     target_heading = None, num_motions_to_load = None):
+                     target_heading = None, num_motions_to_load = None,
+                     motion_ids=None):
         
         if "gts" in self.__dict__:
             del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs, self.dof_pos
@@ -537,7 +546,14 @@ class MotionLibBase():
         else:
             num_motion_to_load = num_motions_to_load
 
-        if random_sample:
+        if motion_ids is not None:
+            sample_idxes = torch.as_tensor(motion_ids, device=self._device, dtype=torch.long)
+            if sample_idxes.ndim != 1 or sample_idxes.numel() == 0:
+                raise ValueError("motion_ids must be a non-empty one-dimensional sequence")
+            if torch.any(sample_idxes < 0) or torch.any(sample_idxes >= self._num_unique_motions):
+                raise IndexError("motion_ids contains an out-of-range global motion id")
+            num_motion_to_load = int(sample_idxes.numel())
+        elif random_sample:
             sample_idxes = self._sample_indices_with_source_mix(
                 self._sampling_prob, self._motion_source_ids, num_motion_to_load, exact_counts=True
             )
@@ -776,6 +792,30 @@ class MotionLibBase():
 
         return motion_ids
     
+
+    @property
+    def num_motion_sources(self) -> int:
+        return len(self._motion_source_names)
+
+    def set_global_emd_sampling(self, probabilities: torch.Tensor) -> None:
+        """Install one normalized EMD-weighted distribution over all trajectories."""
+        if self.num_motion_sources != 1:
+            raise ValueError("Global EMD sampling is only supported for a single logical motion source")
+        probabilities = torch.as_tensor(probabilities, device=self._device, dtype=torch.float32)
+        if probabilities.shape != (self._num_unique_motions,):
+            raise ValueError(f"Expected {self._num_unique_motions} probabilities, got {tuple(probabilities.shape)}")
+        if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0) or float(probabilities.sum()) <= 0:
+            raise ValueError("Global EMD probabilities must be finite, non-negative, and sum to a positive value")
+        self._sampling_prob = probabilities / probabilities.sum()
+        self._global_emd_sampling = True
+        self.all_motions_loaded = False
+        self._refresh_sampling_batch_prob()
+
+    def global_motion_ids(self, local_motion_ids: torch.Tensor) -> torch.Tensor:
+        """Map indices into the currently loaded pool to global (dataset-wide) motion ids."""
+        if self._curr_motion_ids is None:
+            raise RuntimeError("No motion pool is currently loaded")
+        return self._curr_motion_ids[torch.as_tensor(local_motion_ids, device=self._device, dtype=torch.long)]
 
     def get_motion_length(self, motion_ids=None):
         if motion_ids is None:

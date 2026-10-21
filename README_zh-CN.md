@@ -18,6 +18,18 @@
   <img src="./assets/rplab_logo.png" alt="ROBO PARTY LAB Logo" height="72" style="vertical-align: middle;" />
 </p>
 
+## PPO-FB 分支交接入口
+
+本分支从 `main` 的 `0b89378` 开发 PPO-FB controller。换电脑后按以下顺序阅读：
+
+1. [工作总结](WORK_SUMMARY.md)：已完成实现、训练结果、关键模型和已知问题。
+2. [当前计划](PLAN.md)：下一步优先级、验收条件，以及最初的设计与里程碑。
+3. [环境与文件恢复](docs/ppo_fb_setup.md)：安装、数据/模型获取、启动及恢复训练。
+4. [实现说明](docs/ppo_fb_branch.md)：代码职责、预热条件、奖励、评测和基本验证。
+
+下文保留 UFO 原有工作流；PPO-FB 入口是 `run_ppo_fb.sh`。
+数据集、训练输出和 checkpoint 不随 Git 提交，迁移方式见上述恢复文档。
+
 ## UFO 是什么？
 
 UFO 是一个面向人形机器人控制、源代码可用的科研框架。`main` 分支主要用于 MJLab 训练、RobotState 数据导入、tracking/goal/reward inference，以及 ONNX 导出。`deploy` 分支用于 Unitree G1 实机部署和遥操作运行时。

@@ -11,7 +11,6 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 import torch
 import numpy as np
 from torch import Tensor
-import torch.nn.functional as F
 from typing import Tuple, List, Optional
 
 
@@ -725,14 +724,15 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
     flr = torch.tensor(0.1).to(dtype=q_abs.dtype, device=q_abs.device)
     quat_candidates = quat_by_rijk / (2.0 * q_abs[..., None].max(flr))
 
-    return quat_candidates[F.one_hot(q_abs.argmax(dim=-1), num_classes=4) > 0.5, :].reshape(batch_dim + (4,))
+    best = q_abs.argmax(dim=-1)[..., None, None].expand(batch_dim + (1, 4))
+    return quat_candidates.gather(-2, best).squeeze(-2)
 
 def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
     """Returns torch.sqrt(torch.max(0, x)) but with a zero subgradient where x is 0."""
-    ret = torch.zeros_like(x)
     positive_mask = x > 0
-    ret[positive_mask] = torch.sqrt(x[positive_mask])
-    return ret
+    # Keep sqrt's derivative finite on the inactive branch, including at zero.
+    safe_x = torch.where(positive_mask, x, 1.0)
+    return torch.where(positive_mask, torch.sqrt(safe_x), 0.0)
 
 def quat_w_first(rot):
     """Convert quaternion to w-first format."""

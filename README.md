@@ -22,6 +22,16 @@
   <img src="./assets/teleop.gif" alt="Teleoperation Demo" width="760" />
 </p> -->
 
+## PPO-FB branch handoff
+
+This branch contains the PPO-FB controller work built on `main` (`0b89378`). Start with
+[the work summary](WORK_SUMMARY.md), [the current plan](PLAN.md), and
+[new-machine setup and artifact recovery](docs/ppo_fb_setup.md). Implementation details are in
+[the branch guide](docs/ppo_fb_branch.md). These project notes are in Chinese.
+
+The sections below describe the upstream UFO workflows. PPO-FB uses `run_ppo_fb.sh`;
+its seed dataset and model checkpoints are restored separately from Git.
+
 ## Overview
 
 UFO is a source-available research framework for humanoid control. The `main` branch focuses on MJLab training, robot-aware motion-data import, tracking/goal/reward inference, and ONNX export. The most complete and best-tested path is currently Unitree G1.
